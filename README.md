@@ -86,9 +86,15 @@ ApplyIccLut.exe -f
 
 The tool requires **administrator privileges** to enable the Windows calibration management subsystem (`WcsSetCalibrationManagementState`), which is typically OFF after a fresh boot. The executable embeds a `requireAdministrator` manifest, so a UAC prompt will appear automatically when launched.
 
-## Task Scheduler Integration
+## Persistence Across Reboots
 
-To automatically fix the LUT on every logon, create a Task Scheduler task:
+When the tool sets or re-applies a GPU color profile, it also enables the Windows automatic colour management machinery. This means the applied profiles should **survive subsequent reboots** without needing to run the tool again. You generally only need to run it once after initial setup or after changing profiles.
+
+If you find that profiles are still not being applied after a reboot, you can use Task Scheduler as a fallback to run the tool automatically at logon.
+
+## Task Scheduler (Fallback)
+
+If profiles are not persisting across reboots, you can create a Task Scheduler task as a fallback:
 
 1. Open **Task Scheduler** and select **Create Task** (not "Create Basic Task").
 2. **General** tab:
