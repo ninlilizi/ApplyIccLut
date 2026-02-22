@@ -27,10 +27,10 @@ This is the same mechanism used by Windows Color Management in Settings. The `-s
 | Format | Extensions | LUT Source |
 |---|---|---|
 | ICC Profile | `.icc`, `.icm` | VCGT tag (Video Card Gamma Table) or MHC2 RegammaLUT |
-| Cube LUT | `.cube` | 1D LUT (`LUT_1D_SIZE`, up to 65536 entries) |
+| Cube LUT | `.cube` | 1D LUT data only (`LUT_1D_SIZE`, up to 65536 entries) |
 
 - **ICC profiles**: The tool first looks for an MHC2 tag (preferred, higher precision). If not found, it falls back to VCGT. Both parametric (formula-based) and table-based VCGT formats are supported.
-- **Cube files**: Only 1D LUTs are supported (3D LUTs are rejected). Entries are downsampled to 256 via linear interpolation for the `SetDeviceGammaRamp` path. Supports `DOMAIN_MIN`, `DOMAIN_MAX`, `TITLE`, and comment lines.
+- **Cube files**: The `.cube` format (IRIDAS/Adobe) is primarily a 3D LUT format, but also supports 1D LUT data via `LUT_1D_SIZE`. This tool reads only the 1D LUT data; files containing only a 3D LUT (`LUT_3D_SIZE`) are rejected, since `SetDeviceGammaRamp` can only apply per-channel 1D curves. Entries are downsampled to 256 via linear interpolation. Supports `DOMAIN_MIN`, `DOMAIN_MAX`, `TITLE`, and comment lines.
 
 ## Usage
 
@@ -125,7 +125,7 @@ The GPU ColorProfile APIs (`ColorProfileAddDisplayAssociation`, `ColorProfileRem
 - **MHC2 ICC pipeline** supports up to 4096 LUT entries per channel at S15Fixed16 precision, plus a 3x4 color matrix for cross-channel correction. This is applied by the GPU driver, not by this tool directly.
 - The `-s` wake-up kick works by removing and re-adding the profile as the default, which forces the GPU driver to re-read and apply it.
 - The pre-flight ramp check compares the current gamma ramp against both identity and the target LUT to avoid double-application.
-- `.cube` files are parsed per the IRIDAS/Adobe specification. Only `LUT_1D_SIZE` is supported; `LUT_3D_SIZE` entries are rejected since 1D LUTs provide superior per-channel precision for display calibration (cross-channel correction is handled by the MHC2 matrix).
+- `.cube` is primarily a 3D LUT format (IRIDAS/Adobe), but also carries optional 1D LUT data. This tool reads only the 1D portion (`LUT_1D_SIZE`); 3D-only files are rejected since `SetDeviceGammaRamp` can only apply per-channel 1D curves.
 
 ## License
 
