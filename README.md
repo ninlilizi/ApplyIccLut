@@ -94,8 +94,6 @@ To automatically fix the LUT on every logon, create a Task Scheduler task:
 4. Optionally add a short delay (e.g. 5-10 seconds) to allow the display driver to initialize.
 5. Set "Run whether user is logged on or not" is **unchecked** (the tool needs the user's display session).
 
-For the GPU pipeline wake-up approach (`-s`), this is the recommended method since it preserves the full MHC2 precision (up to 4096 LUT entries) without downsampling.
-
 ## Building
 
 ### Requirements
