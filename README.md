@@ -1,6 +1,6 @@
 # ApplyIccLut
 
-A command-line tool for applying display calibration LUTs on Windows 11. Works around the Windows 11 bug where ICC profile LUTs (especially HDR) are not applied at boot.
+A command-line tool for applying display calibration LUTs on Windows 11. Works around the Windows 11 bug where ICC profile LUTs (especially HDR) are not applied at boot. This tool specifically supports Windows 11 24H2. Existing similar tools stopped working on 24H2 and havn't been updated.
 
 ## The Problem
 
