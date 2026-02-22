@@ -744,11 +744,25 @@ using PFN_ColorProfileAddDisplayAssociation = LONG(WINAPI*)(
     BOOL setAsDefault,
     BOOL advancedColor);
 
+// Dedicated "set as default" API - different code path from Remove+Add.
+// This is likely what the Color Management "Set as Default" button calls.
+using PFN_ColorProfileSetDisplayDefaultAssociation = HRESULT(WINAPI*)(
+    WCS_PROFILE_MANAGEMENT_SCOPE scope,
+    PCWSTR profileName,
+    COLORPROFILETYPE type, COLORPROFILESUBTYPE subType,
+    LUID adapterId, UINT32 sourceId);
+
+// Undocumented mscms.dll export that forces the calibration subsystem to
+// reload all display pipelines.
+using PFN_InternalRefreshCalibration = BOOL(WINAPI*)(void);
+
 struct GpuColorProfileApi
 {
     PFN_ColorProfileGetDisplayDefault      GetDefault;
     PFN_ColorProfileRemoveDisplayAssociation Remove;
     PFN_ColorProfileAddDisplayAssociation  Add;
+    PFN_ColorProfileSetDisplayDefaultAssociation SetDefault;
+    PFN_InternalRefreshCalibration         RefreshCalibration;
     bool loaded;
 };
 
@@ -767,6 +781,10 @@ static GpuColorProfileApi LoadGpuColorProfileApi()
         GetProcAddress(hMscms, "ColorProfileRemoveDisplayAssociation"));
     api.Add = reinterpret_cast<PFN_ColorProfileAddDisplayAssociation>(
         GetProcAddress(hMscms, "ColorProfileAddDisplayAssociation"));
+    api.SetDefault = reinterpret_cast<PFN_ColorProfileSetDisplayDefaultAssociation>(
+        GetProcAddress(hMscms, "ColorProfileSetDisplayDefaultAssociation"));
+    api.RefreshCalibration = reinterpret_cast<PFN_InternalRefreshCalibration>(
+        GetProcAddress(hMscms, "InternalRefreshCalibration"));
 
     api.loaded = (api.GetDefault && api.Remove && api.Add);
     return api;
@@ -844,21 +862,37 @@ static bool RestoreGpuProfile(const GpuColorProfileApi& api,
 {
     if (!api.loaded || profileName.empty()) return false;
 
+    // Primary: use ColorProfileSetDisplayDefaultAssociation
+    if (api.SetDefault)
+    {
+        auto subtype = hdr ? CPST_EXTENDED_DISPLAY : CPST_STANDARD_DISPLAY;
+        HRESULT hr = api.SetDefault(
+            WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
+            profileName.c_str(),
+            CPT_ICC, subtype,
+            mon.adapterId, mon.sourceId);
+        if (SUCCEEDED(hr))
+            return true;
+        if (verbose)
+            wprintf(L"    SetDefault failed (hr=0x%08lX), trying Remove+Add\n", hr);
+    }
+
+    // Fallback: Remove + Add
     BOOL advColor = hdr ? TRUE : FALSE;
 
-    // Remove first to ensure clean state
     api.Remove(
         WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
         profileName.c_str(),
         mon.adapterId, mon.sourceId,
         advColor);
 
-    // Add with setAsDefault = true
+    Sleep(200);
+
     LONG err = api.Add(
         WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
         profileName.c_str(),
         mon.adapterId, mon.sourceId,
-        TRUE,       // setAsDefault = true
+        TRUE,
         advColor);
 
     return err == ERROR_SUCCESS;
@@ -996,6 +1030,19 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
         if (!anyRestored)
             wprintf(L"  No GPU color profiles found to restore.\n");
 
+        if (anyRestored)
+        {
+            BOOL prevState = FALSE;
+            if (WcsGetCalibrationManagementState(&prevState))
+            {
+                WcsSetCalibrationManagementState(FALSE);
+                Sleep(100);
+                WcsSetCalibrationManagementState(TRUE);
+            }
+            if (gpuApi.RefreshCalibration)
+                gpuApi.RefreshCalibration();
+        }
+
         wprintf(L"\n");
         return anyRestored;
     }
@@ -1011,56 +1058,90 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
             return false;
         }
 
+        // Step 1: Ensure calibration management is ON *before* profile operations.
+        // The MHC2 docs say the pipeline loader must be explicitly turned on.
+        BOOL calState = FALSE;
+        WcsGetCalibrationManagementState(&calState);
+        if (!calState)
+        {
+            BOOL setOk = WcsSetCalibrationManagementState(TRUE);
+            if (setOk)
+                wprintf(L"  Calibration management: enabled (was OFF).\n");
+            else
+                wprintf(L"  WARNING: WcsSetCalibrationManagementState(TRUE) failed (err=%lu)\n",
+                        GetLastError());
+            Sleep(200);
+        }
+        else if (verbose)
+            wprintf(L"  Calibration management: already ON.\n");
+
         bool anyOk = false;
 
-        if (!setGpuProfile.empty())
+        for (bool hdr : hdrModes)
         {
-            // Explicit name: set as default for the selected pipeline(s)
-            for (bool hdr : hdrModes)
+            // Resolve the profile name for this pipeline
+            std::wstring prof = setGpuProfile;
+            if (prof.empty())
             {
-                BOOL advColor = hdr ? TRUE : FALSE;
-
-                gpuApi.Remove(
-                    WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
-                    setGpuProfile.c_str(),
-                    mon.adapterId, mon.sourceId,
-                    advColor);
-
-                LONG err = gpuApi.Add(
-                    WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
-                    setGpuProfile.c_str(),
-                    mon.adapterId, mon.sourceId,
-                    TRUE,       // setAsDefault = true
-                    advColor);
-
-                if (err == ERROR_SUCCESS)
-                {
-                    wprintf(L"  GPU %s profile set to: %s\n",
-                            hdr ? L"HDR" : L"SDR", setGpuProfile.c_str());
-                    anyOk = true;
-                }
-                else
-                {
-                    wprintf(L"  ERROR: Failed to set GPU %s profile (err=%ld)\n",
-                            hdr ? L"HDR" : L"SDR", err);
-                    if (err == ERROR_FILE_NOT_FOUND || err == 2)
-                        wprintf(L"  HINT: Is the profile installed? Check spool\\drivers\\color\n");
-                }
-            }
-        }
-        else
-        {
-            // No name: re-apply current defaults for selected pipeline(s) (wake-up kick)
-            for (bool hdr : hdrModes)
-            {
-                std::wstring prof = GetGpuDefaultProfile(gpuApi, mon, hdr, verbose);
+                prof = GetGpuDefaultProfile(gpuApi, mon, hdr, verbose);
                 if (prof.empty())
                 {
                     if (verbose)
                         wprintf(L"  No GPU %s profile set.\n", hdr ? L"HDR" : L"SDR");
                     continue;
                 }
+            }
 
+            const wchar_t* pipeLabel = hdr ? L"HDR" : L"SDR";
+            const wchar_t* actionLabel = setGpuProfile.empty() ? L"re-applied" : L"set to";
+            auto subtype = hdr ? CPST_EXTENDED_DISPLAY : CPST_STANDARD_DISPLAY;
+            bool ok = false;
+
+            // Method A: WcsSetDefaultColorProfile (the old colorcpl.exe API).
+            // Uses device name, completely different code path from newer APIs.
+            if (!ok && !mon.eddDeviceId.empty())
+            {
+                BOOL wcsOk = WcsSetDefaultColorProfile(
+                    WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
+                    mon.eddDeviceId.c_str(),
+                    CPT_ICC, subtype,
+                    0,  // dwProfileID
+                    prof.c_str());
+
+                if (wcsOk)
+                {
+                    wprintf(L"  GPU %s profile %s: %s  (WcsSetDefault)\n",
+                            pipeLabel, actionLabel, prof.c_str());
+                    ok = true;
+                }
+                else if (verbose)
+                    wprintf(L"  WcsSetDefaultColorProfile %s failed (err=%lu)\n",
+                            pipeLabel, GetLastError());
+            }
+
+            // Method B: ColorProfileSetDisplayDefaultAssociation (newer API)
+            if (!ok && gpuApi.SetDefault)
+            {
+                HRESULT hr = gpuApi.SetDefault(
+                    WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
+                    prof.c_str(),
+                    CPT_ICC, subtype,
+                    mon.adapterId, mon.sourceId);
+
+                if (SUCCEEDED(hr))
+                {
+                    wprintf(L"  GPU %s profile %s: %s  (SetDefault)\n",
+                            pipeLabel, actionLabel, prof.c_str());
+                    ok = true;
+                }
+                else if (verbose)
+                    wprintf(L"  ColorProfileSetDisplayDefaultAssociation %s failed (hr=0x%08lX)\n",
+                            pipeLabel, hr);
+            }
+
+            // Method C: Remove + Add with setAsDefault=true
+            if (!ok)
+            {
                 BOOL advColor = hdr ? TRUE : FALSE;
 
                 gpuApi.Remove(
@@ -1069,29 +1150,117 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
                     mon.adapterId, mon.sourceId,
                     advColor);
 
+                Sleep(200);
+
                 LONG err = gpuApi.Add(
                     WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
                     prof.c_str(),
                     mon.adapterId, mon.sourceId,
-                    TRUE,       // setAsDefault = true
+                    TRUE,
                     advColor);
 
                 if (err == ERROR_SUCCESS)
                 {
-                    wprintf(L"  GPU %s profile re-applied: %s\n",
-                            hdr ? L"HDR" : L"SDR", prof.c_str());
-                    anyOk = true;
+                    wprintf(L"  GPU %s profile %s: %s  (Remove+Add)\n",
+                            pipeLabel, actionLabel, prof.c_str());
+                    ok = true;
                 }
                 else
-                    wprintf(L"  WARNING: Failed to re-apply GPU %s profile (err=%ld)\n",
-                            hdr ? L"HDR" : L"SDR", err);
+                {
+                    wprintf(L"  ERROR: Failed to set GPU %s profile (err=%ld)\n",
+                            pipeLabel, err);
+                    if (err == ERROR_FILE_NOT_FOUND || err == 2)
+                        wprintf(L"  HINT: Is the profile installed? Check spool\\drivers\\color\n");
+                }
             }
 
-            if (!anyOk)
+            if (ok) anyOk = true;
+        }
+
+        if (!anyOk && setGpuProfile.empty())
+        {
+            wprintf(L"  ERROR: No GPU profiles found to re-apply.\n");
+            wprintf(L"  Use -s <name> to specify a profile.\n");
+        }
+
+        // Post-profile activation: trigger calibration reload via all known mechanisms
+        if (anyOk)
+        {
+            wprintf(L"  Activating calibration pipeline (please wait)...\n");
+
+            // A) Toggle calibration management OFF/ON to force re-evaluation
+            WcsSetCalibrationManagementState(FALSE);
+            Sleep(100);
+            BOOL setOk = WcsSetCalibrationManagementState(TRUE);
+            if (verbose)
+                wprintf(L"  Calibration management toggle: %s\n",
+                        setOk ? L"OK" : L"failed");
+
+            // B) InternalRefreshCalibration (undocumented reload trigger)
+            if (gpuApi.RefreshCalibration)
             {
-                wprintf(L"  ERROR: No GPU profiles found to re-apply.\n");
-                wprintf(L"  Use -s <name> to specify a profile.\n");
+                gpuApi.RefreshCalibration();
+                if (verbose)
+                    wprintf(L"  InternalRefreshCalibration called.\n");
             }
+
+            // C) Broadcast WM_SETTINGCHANGE with "ImmersiveColorSet" -
+            //    the system message Windows sends when HDR/color settings change.
+            DWORD_PTR result = 0;
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                                (LPARAM)L"ImmersiveColorSet",
+                                SMTO_ABORTIFHUNG | SMTO_NOTIMEOUTIFNOTHUNG,
+                                5000, &result);
+            if (verbose)
+                wprintf(L"  WM_SETTINGCHANGE ImmersiveColorSet broadcast sent.\n");
+
+            // D) Re-apply display config (triggers WM_DISPLAYCHANGE)
+            UINT32 pathCount = 0, modeCount = 0;
+            if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+                                            &pathCount, &modeCount) == ERROR_SUCCESS)
+            {
+                std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+                std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+                if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                       &pathCount, paths.data(),
+                                       &modeCount, modes.data(),
+                                       nullptr) == ERROR_SUCCESS)
+                {
+                    paths.resize(pathCount);
+                    modes.resize(modeCount);
+                    LONG dcErr = SetDisplayConfig(
+                        (UINT32)paths.size(), paths.data(),
+                        (UINT32)modes.size(), modes.data(),
+                        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
+                    if (verbose)
+                        wprintf(L"  SetDisplayConfig refresh: %s (err=%ld)\n",
+                                dcErr == ERROR_SUCCESS ? L"OK" : L"failed", dcErr);
+                }
+            }
+
+            // E) Run the Windows Calibration Loader scheduled task directly.
+            //    This is the official Windows mechanism for loading calibrations.
+            wprintf(L"  Triggering Calibration Loader task...\n");
+            STARTUPINFOW si = {};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION pi = {};
+            wchar_t cmdLine[] = L"schtasks.exe /run /tn \"\\Microsoft\\Windows\\WindowsColorSystem\\Calibration Loader\"";
+            if (CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+            {
+                WaitForSingleObject(pi.hProcess, 5000);
+                DWORD exitCode = 0;
+                GetExitCodeProcess(pi.hProcess, &exitCode);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+                if (verbose)
+                    wprintf(L"  Calibration Loader task: exit code %lu\n", exitCode);
+            }
+            else if (verbose)
+                wprintf(L"  Calibration Loader task: CreateProcess failed (err=%lu)\n",
+                        GetLastError());
         }
 
         wprintf(L"\n");

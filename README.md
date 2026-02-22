@@ -82,17 +82,23 @@ ApplyIccLut.exe -R --sdr
 ApplyIccLut.exe -f
 ```
 
+## Administrator Privileges
+
+The tool requires **administrator privileges** to enable the Windows calibration management subsystem (`WcsSetCalibrationManagementState`), which is typically OFF after a fresh boot. The executable embeds a `requireAdministrator` manifest, so a UAC prompt will appear automatically when launched.
+
 ## Task Scheduler Integration
 
 To automatically fix the LUT on every logon, create a Task Scheduler task:
 
-1. Open **Task Scheduler** and create a new task.
-2. **Trigger**: "At log on" (for your user account).
-3. **Action**: Start a program.
+1. Open **Task Scheduler** and select **Create Task** (not "Create Basic Task").
+2. **General** tab:
+   - Check **"Run with highest privileges"** (required for calibration management APIs).
+   - Ensure **"Run only when user is logged on"** is selected (the tool needs the user's display session).
+3. **Trigger** tab: Add a trigger for **"At log on"** (for your user account).
+   - Optionally add a delay (e.g. 10 seconds) to allow the display driver to initialize.
+4. **Action** tab: Add **"Start a program"**.
    - **Program**: Full path to `ApplyIccLut.exe`
    - **Arguments**: No arguments needed (defaults to all monitors). Or use `-m 1` to target a specific monitor, `--hdr` for HDR only, etc.
-4. Optionally add a short delay (e.g. 5-10 seconds) to allow the display driver to initialize.
-5. Set "Run whether user is logged on or not" is **unchecked** (the tool needs the user's display session).
 
 ## Building
 
