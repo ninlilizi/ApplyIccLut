@@ -140,15 +140,22 @@ static const float3x3 bt2020_to_bt709 = {
     -0.018151, -0.100579,  1.118730
 };
 
+// ---- Fast gamma 2.2 approximation (cubic polynomial) ----
+// From dwm_lut_fps_boost: replaces expensive pow(x, 2.2) with 3 MAD ops.
+// Max error ~0.003 on [0,1] which is well within 8-bit precision (1/255).
+float3 FastPow22(float3 x) {
+    return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878);
+}
+
 // ---- SDR dithering (gamma-encoded content) ----
 float3 OrderedDitherSDR(float3 rgb, float2 pos) {
     float3 low  = floor(rgb * levels) / levels;
     float3 high = low + 1.0 / levels;
 
-    // Linearize with sRGB-approximate gamma for threshold comparison
-    float3 rgb_lin  = pow(saturate(rgb), 2.2);
-    float3 low_lin  = pow(saturate(low), 2.2);
-    float3 high_lin = pow(saturate(high), 2.2);
+    // Linearize with fast gamma 2.2 approximation for threshold comparison
+    float3 rgb_lin  = FastPow22(saturate(rgb));
+    float3 low_lin  = FastPow22(saturate(low));
+    float3 high_lin = FastPow22(saturate(high));
 
     float noise = noiseTex.Sample(noiseSmp, pos / 64.0).x;
     float3 threshold = lerp(low_lin, high_lin, noise);
@@ -158,10 +165,9 @@ float3 OrderedDitherSDR(float3 rgb, float2 pos) {
 
 // ---- HDR dithering (PQ-aware, scRGB input) ----
 // The quantization bottleneck is in PQ space (after Windows converts scRGB->PQ
-// for the 10-bit HDR output). A bad scaler may further truncate to 8-bit in PQ.
-// We dither in PQ space so that after quantization the error is spatially
-// distributed with blue-noise, and we compare thresholds in linear light
-// for perceptual uniformity.
+// for the 10-bit HDR output).  PQ (ST 2084) is perceptually uniform by design,
+// so we threshold directly in PQ space -- no need to decode to linear first.
+// This halves the pow() calls vs the linear-threshold approach.
 float3 OrderedDitherHDR(float3 scrgb, float2 pos) {
     // scRGB -> BT.2020 linear, normalized for PQ (1.0 = 10000 nits, scRGB 1.0 = 80 nits)
     float3 bt2020_lin = mul(bt709_to_bt2020, scrgb) * (80.0 / 10000.0);
@@ -174,15 +180,9 @@ float3 OrderedDitherHDR(float3 scrgb, float2 pos) {
     float3 low  = floor(pq * levels) / levels;
     float3 high = low + 1.0 / levels;
 
-    // Decode quantization boundaries back to linear for threshold comparison
-    float3 low_lin  = PQToLinear(low);
-    float3 high_lin = PQToLinear(high);
-
+    // Threshold in PQ space (perceptually uniform, so noise distributes evenly)
     float noise = noiseTex.Sample(noiseSmp, pos / 64.0).x;
-    float3 threshold = lerp(low_lin, high_lin, noise);
-
-    // Choose low or high PQ value based on where the linear signal falls
-    float3 result_pq = lerp(low, high, bt2020_lin > threshold);
+    float3 result_pq = lerp(low, high, pq > lerp(low, high, noise));
 
     // Decode back: PQ -> BT.2020 linear -> scRGB
     float3 result_lin = PQToLinear(result_pq) * (10000.0 / 80.0);
