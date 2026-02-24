@@ -61,7 +61,7 @@ static void DiagLog(const char* fmt, ...)
 #pragma pack(push, 1)
 struct DitherConfig {
     UINT32 magic;              // 'DITH' (0x48544944)
-    UINT32 version;            // struct version (1)
+    UINT32 version;            // struct version (2)
     INT64  presentOffset;      // COverlayContext::Present offset from dwmcore base
     INT64  directFlipOffset;   // IsCandidateDirectFlipCompatible offset from dwmcore base
     INT64  overlaysOffset;     // OverlaysEnabled offset from dwmcore base
@@ -69,14 +69,16 @@ struct DitherConfig {
     INT32  swapChainOffset;    // IOverlaySwapChain IDXGISwapChain offset (pre-resolved for OS version)
     UINT32 isWindows11;        // 1 if Win11+ (affects overlay pointer resolution in Present hook)
     UINT32 ditherBits;         // 0 = auto (SDR=8, HDR=10), otherwise forced bit depth
+    UINT32 isWindows11_24h2;   // 1 if Win11 24H2+ (different function signatures & access pattern)
 };
 #pragma pack(pop)
 
 static const UINT32 DITHER_CONFIG_MAGIC = 0x48544944; // 'DITH'
-static const UINT32 DITHER_CONFIG_VERSION = 1;
+static const UINT32 DITHER_CONFIG_VERSION = 2;
 
 // Runtime values read from config (used by hooks)
 static bool g_isWindows11 = false;
+static bool g_isWindows11_24h2 = false;
 static int  g_hwProtOffset = 0;
 static int  g_swapChainOffset = 0;
 
@@ -599,57 +601,100 @@ typedef struct rectVec {
     struct tagRECT* cap;
 } rectVec;
 
+// ============================================================================
+// Hook: COverlayContext::Present — pre-24H2 (6 params, returns long)
+// ============================================================================
+
 typedef long (COverlayContext_Present_t)(void*, void*, unsigned int, rectVec*, unsigned int, bool);
 
 static COverlayContext_Present_t* COverlayContext_Present_orig = NULL;
 static COverlayContext_Present_t* COverlayContext_Present_real_orig = NULL;
-static bool g_firstHookCallLogged = false;
+
+// ============================================================================
+// Hook: COverlayContext::Present — 24H2+ (7 params, returns long long)
+// ============================================================================
+
+typedef long long (COverlayContext_Present_24h2_t)(void*, void*, unsigned int, rectVec*, int, void*, bool);
+
+static COverlayContext_Present_24h2_t* COverlayContext_Present_orig_24h2 = NULL;
+static COverlayContext_Present_24h2_t* COverlayContext_Present_real_orig_24h2 = NULL;
+
+// Shared state
+static volatile LONG g_hookCallCount = 0;
+static volatile LONG g_hookDitherCount = 0;
+
+// Common Present logic — called from both hook variants
+static void PresentHookCommon(void* self, void* overlaySwapChain, rectVec* rectVec)
+{
+    if (*((bool*)overlaySwapChain + g_hwProtOffset))
+    {
+        UnsetDitherActive(self);
+    }
+    else
+    {
+        IDXGISwapChain* swapChain;
+        if (g_isWindows11_24h2)
+        {
+            // 24H2+: direct offset on overlaySwapChain
+            swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain + g_swapChainOffset);
+        }
+        else if (g_isWindows11)
+        {
+            // Pre-24H2 Win11: indirect through legacy overlay pointer
+            int sub = *(int*)((unsigned char*)overlaySwapChain - 4);
+            void* realOverlay = (unsigned char*)overlaySwapChain - sub - 0x1b0;
+            swapChain = *(IDXGISwapChain**)((unsigned char*)realOverlay + g_swapChainOffset);
+        }
+        else
+        {
+            // Win10: direct offset
+            swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain + g_swapChainOffset);
+        }
+
+        if (ApplyDither(swapChain, rectVec->start, (int)(rectVec->end - rectVec->start)))
+        {
+            InterlockedIncrement(&g_hookDitherCount);
+            SetDitherActive(self);
+        }
+        else
+            UnsetDitherActive(self);
+    }
+}
+
+static void PresentHookFirstCall(void* self, void* overlaySwapChain)
+{
+    DiagOpen();
+    DiagLog("=== HOOK CALLED! First Present hook invocation ===");
+    DiagLog("  self=%p overlaySwapChain=%p is24h2=%d", self, overlaySwapChain, (int)g_isWindows11_24h2);
+    DiagClose();
+}
 
 static long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned int a3,
                                          rectVec* rectVec, unsigned int a5, bool a6)
 {
-    if (!g_firstHookCallLogged)
-    {
-        g_firstHookCallLogged = true;
-        DiagOpen();
-        DiagLog("=== HOOK CALLED! First Present hook invocation ===");
-        DiagLog("  self=%p overlaySwapChain=%p retAddr=%p realOrig=%p",
-                self, overlaySwapChain, _ReturnAddress(), COverlayContext_Present_real_orig);
-        DiagClose();
-    }
+    LONG count = InterlockedIncrement(&g_hookCallCount);
+    if (count == 1) PresentHookFirstCall(self, overlaySwapChain);
 
-    if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig)
-    {
-        if (*((bool*)overlaySwapChain + g_hwProtOffset))
-        {
-            UnsetDitherActive(self);
-        }
-        else
-        {
-            IDXGISwapChain* swapChain;
-            if (g_isWindows11)
-            {
-                int sub = *(int*)((unsigned char*)overlaySwapChain - 4);
-                void* realOverlay = (unsigned char*)overlaySwapChain - sub - 0x1b0;
-                swapChain = *(IDXGISwapChain**)((unsigned char*)realOverlay + g_swapChainOffset);
-            }
-            else
-            {
-                swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain + g_swapChainOffset);
-            }
-
-            if (ApplyDither(swapChain, rectVec->start, (int)(rectVec->end - rectVec->start)))
-                SetDitherActive(self);
-            else
-                UnsetDitherActive(self);
-        }
-    }
+    if (g_isWindows11 || _ReturnAddress() < (void*)COverlayContext_Present_real_orig)
+        PresentHookCommon(self, overlaySwapChain, rectVec);
 
     return COverlayContext_Present_orig(self, overlaySwapChain, a3, rectVec, a5, a6);
 }
 
+static long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3,
+                                                    rectVec* rectVec, int a5, void* a6, bool a7)
+{
+    LONG count = InterlockedIncrement(&g_hookCallCount);
+    if (count == 1) PresentHookFirstCall(self, overlaySwapChain);
+
+    // 24H2+: always enter (no _ReturnAddress guard needed)
+    PresentHookCommon(self, overlaySwapChain, rectVec);
+
+    return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
+}
+
 // ============================================================================
-// Hook: COverlayContext::IsCandidateDirectFlipCompatible (disable DirectFlip)
+// Hook: COverlayContext::IsCandidateDirectFlipCompatible — pre-24H2 (8 params)
 // ============================================================================
 
 typedef bool (COverlayContext_IsCandidateDirectFlipCompatbile_t)(void*, void*, void*, void*, int, unsigned int, bool, bool);
@@ -665,7 +710,23 @@ static bool COverlayContext_IsCandidateDirectFlipCompatbile_hook(void* self, voi
 }
 
 // ============================================================================
-// Hook: COverlayContext::OverlaysEnabled (disable MPO)
+// Hook: COverlayContext::IsCandidateDirectFlipCompatible — 24H2+ (6 params)
+// ============================================================================
+
+typedef bool (COverlayContext_IsCandidateDirectFlipCompatbile_24h2_t)(void*, void*, void*, void*, unsigned int, bool);
+
+static COverlayContext_IsCandidateDirectFlipCompatbile_24h2_t* COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 = NULL;
+
+static bool COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2(void* self, void* a2, void* a3, void* a4,
+                                                                       unsigned int a5, bool a6)
+{
+    if (IsDitherActive(self))
+        return false;
+    return COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2(self, a2, a3, a4, a5, a6);
+}
+
+// ============================================================================
+// Hook: COverlayContext::OverlaysEnabled (same signature all versions)
 // ============================================================================
 
 typedef bool (COverlayContext_OverlaysEnabled_t)(void*);
@@ -708,7 +769,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             else
             {
                 DWORD fileSize = GetFileSize(hTest, NULL);
-                DiagLog("  Config file exists, size=%lu (expected %zu)", fileSize, sizeof(DitherConfig));
+                DiagLog("  Config file exists, size=%lu (expected %lu)", fileSize, (unsigned long)sizeof(DitherConfig));
                 if (fileSize >= sizeof(DitherConfig))
                 {
                     DitherConfig raw = {};
@@ -722,11 +783,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             DiagClose();
             return FALSE;
         }
-        DiagLog("ReadConfig OK: present=0x%llx directflip=0x%llx overlays=0x%llx",
-                (unsigned long long)cfg.presentOffset, (unsigned long long)cfg.directFlipOffset,
-                (unsigned long long)cfg.overlaysOffset);
-        DiagLog("  hwProt=%d swapChain=%d isWin11=%u bits=%u",
-                cfg.hwProtOffset, cfg.swapChainOffset, cfg.isWindows11, cfg.ditherBits);
+        DiagLog("ReadConfig OK: present=0x%lx directflip=0x%lx overlays=0x%lx",
+                (unsigned long)cfg.presentOffset, (unsigned long)cfg.directFlipOffset,
+                (unsigned long)cfg.overlaysOffset);
+        DiagLog("  hwProt=%d swapChain=%d isWin11=%u is24h2=%u bits=%u",
+                cfg.hwProtOffset, cfg.swapChainOffset, cfg.isWindows11, cfg.isWindows11_24h2, cfg.ditherBits);
 
         // Get dwmcore.dll base in our process to resolve offsets to absolute addresses
         HMODULE dwmcore = GetModuleHandle(L"dwmcore.dll");
@@ -740,29 +801,44 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
         unsigned char* base = (unsigned char*)dwmcore;
 
-        COverlayContext_Present_orig = (COverlayContext_Present_t*)(base + cfg.presentOffset);
-        COverlayContext_Present_real_orig = COverlayContext_Present_orig;
-        COverlayContext_IsCandidateDirectFlipCompatbile_orig =
-            (COverlayContext_IsCandidateDirectFlipCompatbile_t*)(base + cfg.directFlipOffset);
-        COverlayContext_OverlaysEnabled_orig =
-            (COverlayContext_OverlaysEnabled_t*)(base + cfg.overlaysOffset);
+        void* presentAddr = (void*)(base + cfg.presentOffset);
+        void* directFlipAddr = (void*)(base + cfg.directFlipOffset);
+        void* overlaysAddr = (void*)(base + cfg.overlaysOffset);
 
-        DiagLog("Hook targets: Present=%p DirectFlip=%p Overlays=%p",
-                COverlayContext_Present_orig,
-                COverlayContext_IsCandidateDirectFlipCompatbile_orig,
-                COverlayContext_OverlaysEnabled_orig);
+        if (cfg.isWindows11_24h2) {
+            COverlayContext_Present_orig_24h2 = (COverlayContext_Present_24h2_t*)presentAddr;
+            COverlayContext_Present_real_orig_24h2 = COverlayContext_Present_orig_24h2;
+            COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 =
+                (COverlayContext_IsCandidateDirectFlipCompatbile_24h2_t*)directFlipAddr;
+        } else {
+            COverlayContext_Present_orig = (COverlayContext_Present_t*)presentAddr;
+            COverlayContext_Present_real_orig = COverlayContext_Present_orig;
+            COverlayContext_IsCandidateDirectFlipCompatbile_orig =
+                (COverlayContext_IsCandidateDirectFlipCompatbile_t*)directFlipAddr;
+        }
+        COverlayContext_OverlaysEnabled_orig = (COverlayContext_OverlaysEnabled_t*)overlaysAddr;
+
+        DiagLog("Hook targets: Present=%p DirectFlip=%p Overlays=%p (24h2=%d)",
+                presentAddr, directFlipAddr, overlaysAddr, (int)cfg.isWindows11_24h2);
+
+        // Dump prologue BEFORE hooking to verify we're at a real function
+        {
+            unsigned char* p = (unsigned char*)presentAddr;
+            DiagLog("Present BEFORE hook: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+        }
 
         // Store runtime parameters from config
         g_isWindows11 = (cfg.isWindows11 != 0);
+        g_isWindows11_24h2 = (cfg.isWindows11_24h2 != 0);
         g_hwProtOffset = cfg.hwProtOffset;
         g_swapChainOffset = cfg.swapChainOffset;
         g_configBits = (int)cfg.ditherBits;
 
-        // Install hooks (check return values)
-        MH_STATUS mhStatus;
-
-        mhStatus = MH_Initialize();
-        DiagLog("MH_Initialize: %d", (int)mhStatus);
+        // Install hooks via MinHook
+        MH_STATUS mhStatus = MH_Initialize();
+        DiagLog("MH_Initialize: %d (%s)", mhStatus, MH_StatusToString(mhStatus));
         if (mhStatus != MH_OK)
         {
             DiagLog("FAIL: MH_Initialize failed");
@@ -770,23 +846,122 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
             return FALSE;
         }
 
-        mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig,
-                       (PVOID)COverlayContext_Present_hook,
-                       (PVOID*)&COverlayContext_Present_orig);
-        DiagLog("MH_CreateHook(Present): %d", (int)mhStatus);
+        if (g_isWindows11_24h2) {
+            mhStatus = MH_CreateHook(presentAddr, (PVOID)COverlayContext_Present_hook_24h2,
+                                     (PVOID*)&COverlayContext_Present_orig_24h2);
+            DiagLog("MH_CreateHook(Present_24h2): %d (%s)", mhStatus, MH_StatusToString(mhStatus));
 
-        mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
-                       (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook,
-                       (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig);
-        DiagLog("MH_CreateHook(DirectFlip): %d", (int)mhStatus);
+            mhStatus = MH_CreateHook(directFlipAddr, (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2,
+                                     (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2);
+            DiagLog("MH_CreateHook(DirectFlip_24h2): %d (%s)", mhStatus, MH_StatusToString(mhStatus));
+        } else {
+            mhStatus = MH_CreateHook(presentAddr, (PVOID)COverlayContext_Present_hook,
+                                     (PVOID*)&COverlayContext_Present_orig);
+            DiagLog("MH_CreateHook(Present): %d (%s)", mhStatus, MH_StatusToString(mhStatus));
 
-        mhStatus = MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig,
-                       (PVOID)COverlayContext_OverlaysEnabled_hook,
-                       (PVOID*)&COverlayContext_OverlaysEnabled_orig);
-        DiagLog("MH_CreateHook(Overlays): %d", (int)mhStatus);
+            mhStatus = MH_CreateHook(directFlipAddr, (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook,
+                                     (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig);
+            DiagLog("MH_CreateHook(DirectFlip): %d (%s)", mhStatus, MH_StatusToString(mhStatus));
+        }
+
+        mhStatus = MH_CreateHook(overlaysAddr, (PVOID)COverlayContext_OverlaysEnabled_hook,
+                                 (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+        DiagLog("MH_CreateHook(Overlays): %d (%s)", mhStatus, MH_StatusToString(mhStatus));
 
         mhStatus = MH_EnableHook(MH_ALL_HOOKS);
-        DiagLog("MH_EnableHook(ALL): %d", (int)mhStatus);
+        DiagLog("MH_EnableHook(ALL): %d (%s)", mhStatus, MH_StatusToString(mhStatus));
+
+        if (mhStatus != MH_OK)
+        {
+            DiagLog("FAIL: MH_EnableHook failed");
+            DiagClose();
+            return FALSE;
+        }
+
+        // Full JMP chain verification
+        {
+            void* realOrig = g_isWindows11_24h2 ?
+                (void*)COverlayContext_Present_real_orig_24h2 :
+                (void*)COverlayContext_Present_real_orig;
+            void* trampoline = g_isWindows11_24h2 ?
+                (void*)COverlayContext_Present_orig_24h2 :
+                (void*)COverlayContext_Present_orig;
+            void* hookFn = g_isWindows11_24h2 ?
+                (void*)COverlayContext_Present_hook_24h2 :
+                (void*)COverlayContext_Present_hook;
+
+            unsigned char* p = (unsigned char*)realOrig;
+            DiagLog("Present @%p AFTER hook: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    p, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]);
+            DiagLog("Hook fn: %p, trampoline: %p", hookFn, trampoline);
+
+            if (p[0] == 0xE9) {
+                INT32 rel = *(INT32*)(p + 1);
+                unsigned char* jmpTarget = p + 5 + rel;
+                DiagLog("  E9 JMP -> %p (rel32=0x%08X)", jmpTarget, (unsigned)rel);
+                DiagLog("  target bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
+                        jmpTarget[0], jmpTarget[1], jmpTarget[2], jmpTarget[3],
+                        jmpTarget[4], jmpTarget[5], jmpTarget[6], jmpTarget[7]);
+
+                // Decode FF 25 indirect JMP to verify full chain reaches our hook
+                if (jmpTarget[0] == 0xFF && jmpTarget[1] == 0x25) {
+                    INT32 indRel = *(INT32*)(jmpTarget + 2);
+                    void** pFinalAddr = (void**)(jmpTarget + 6 + indRel);
+                    void* finalAddr = *pFinalAddr;
+                    DiagLog("  FF25 -> [%p] = %p", pFinalAddr, finalAddr);
+                    DiagLog("  Chain targets hook fn: %s",
+                            (finalAddr == hookFn) ? "YES" : "NO <<<< MISMATCH!");
+                }
+
+                // Check page protections along the chain
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (VirtualQuery(jmpTarget, &mbi, sizeof(mbi)))
+                    DiagLog("  rbCodeIn page: protect=0x%lx state=0x%lx type=0x%lx",
+                            mbi.Protect, mbi.State, mbi.Type);
+            } else {
+                DiagLog("  WARNING: byte[0]=0x%02X, NOT E9 JMP!", p[0]);
+            }
+
+            MEMORY_BASIC_INFORMATION mbi2 = {};
+            if (VirtualQuery(trampoline, &mbi2, sizeof(mbi2)))
+                DiagLog("  Trampoline page: protect=0x%lx type=0x%lx", mbi2.Protect, mbi2.Type);
+            MEMORY_BASIC_INFORMATION mbi3 = {};
+            if (VirtualQuery(hookFn, &mbi3, sizeof(mbi3)))
+                DiagLog("  Hook fn page: protect=0x%lx type=0x%lx", mbi3.Protect, mbi3.Type);
+
+            // Check the PATCHED page protection (the dwmcore.dll code page we modified)
+            MEMORY_BASIC_INFORMATION mbi4 = {};
+            if (VirtualQuery(p, &mbi4, sizeof(mbi4)))
+                DiagLog("  Patched code page: protect=0x%lx type=0x%lx", mbi4.Protect, mbi4.Type);
+        }
+
+        // Check process mitigation policies
+        {
+            typedef BOOL (WINAPI *GetProcessMitigationPolicy_t)(HANDLE, int, PVOID, SIZE_T);
+            auto pGetPolicy = (GetProcessMitigationPolicy_t)GetProcAddress(
+                GetModuleHandleW(L"kernel32.dll"), "GetProcessMitigationPolicy");
+            if (pGetPolicy) {
+                struct { DWORD Flags; } dynPolicy = {};
+                if (pGetPolicy(GetCurrentProcess(), 2, &dynPolicy, sizeof(dynPolicy)))
+                    DiagLog("ACG flags: 0x%lx", dynPolicy.Flags);
+                struct { DWORD Flags; } sigPolicy = {};
+                if (pGetPolicy(GetCurrentProcess(), 8, &sigPolicy, sizeof(sigPolicy)))
+                    DiagLog("Signature flags: 0x%lx", sigPolicy.Flags);
+            }
+        }
+
+        // Check if VBS/HVCI might be silently active (NtQuerySystemInformation)
+        {
+            typedef LONG (NTAPI *NtQuerySystemInformation_t)(ULONG, PVOID, ULONG, PULONG);
+            auto pNtQSI = (NtQuerySystemInformation_t)GetProcAddress(
+                GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+            if (pNtQSI) {
+                // SystemCodeIntegrityInformation (class 103)
+                struct { ULONG Length; ULONG CodeIntegrityOptions; } ciInfo = { sizeof(ciInfo), 0 };
+                LONG status = pNtQSI(103, &ciInfo, sizeof(ciInfo), NULL);
+                DiagLog("CodeIntegrity: status=0x%lx options=0x%lx (bit0=HVCI)", status, ciInfo.CodeIntegrityOptions);
+            }
+        }
 
         DiagLog("=== DllMain DLL_PROCESS_ATTACH complete (success) ===");
         DiagClose();
@@ -794,7 +969,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
     }
     case DLL_PROCESS_DETACH:
         DiagOpen();
-        DiagLog("=== DllMain DLL_PROCESS_DETACH ===");
+        DiagLog("=== DllMain DLL_PROCESS_DETACH (hook calls: %ld, dither: %ld) ===",
+                g_hookCallCount, g_hookDitherCount);
+        MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
         Sleep(100);
         UninitializeStuff();

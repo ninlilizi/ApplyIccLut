@@ -1593,10 +1593,10 @@ static const unsigned char pat_overlays_w11_25h2[] = {
 // IOverlaySwapChain offsets (version-specific, passed to DLL via config)
 static const int OVERLAY_SWAPCHAIN_OFFSET_W10     = -0x118;
 static const int OVERLAY_SWAPCHAIN_OFFSET_W11     = 0xE0;
-static const int OVERLAY_SWAPCHAIN_OFFSET_W11_24H2 = 0xE8;
+static const int OVERLAY_SWAPCHAIN_OFFSET_W11_24H2 = 0x108; // 24H2+: direct offset on overlaySwapChain
 static const int OVERLAY_HWPROT_OFFSET_W10     = -0xbc;
 static const int OVERLAY_HWPROT_OFFSET_W11     = -0x144;
-static const int OVERLAY_HWPROT_OFFSET_W11_24H2 = -0x14C;
+static const int OVERLAY_HWPROT_OFFSET_W11_24H2 = 0x64;   // 24H2+: direct offset on overlaySwapChain
 
 // ============================================================================
 // Cross-version pattern sets for --probe mode
@@ -1642,7 +1642,7 @@ static const int NUM_PATTERN_SETS = sizeof(ALL_PATTERNS) / sizeof(ALL_PATTERNS[0
 #pragma pack(push, 1)
 struct DitherConfig {
     UINT32 magic;              // 'DITH' (0x48544944)
-    UINT32 version;            // struct version (1)
+    UINT32 version;            // struct version (2)
     INT64  presentOffset;      // COverlayContext::Present offset from dwmcore base
     INT64  directFlipOffset;   // IsCandidateDirectFlipCompatible offset from dwmcore base
     INT64  overlaysOffset;     // OverlaysEnabled offset from dwmcore base
@@ -1650,11 +1650,12 @@ struct DitherConfig {
     INT32  swapChainOffset;    // IOverlaySwapChain IDXGISwapChain offset
     UINT32 isWindows11;        // 1 if Win11+ (affects overlay pointer resolution)
     UINT32 ditherBits;         // 0 = auto, otherwise forced bit depth
+    UINT32 isWindows11_24h2;   // 1 if Win11 24H2+ (different function signatures & access pattern)
 };
 #pragma pack(pop)
 
 static const UINT32 DITHER_CONFIG_MAGIC = 0x48544944;
-static const UINT32 DITHER_CONFIG_VERSION = 1;
+static const UINT32 DITHER_CONFIG_VERSION = 2;
 
 // ============================================================================
 // Offset cache — caches discovered offsets keyed by dwmcore.dll file version
@@ -1764,6 +1765,7 @@ static bool ScanDwmcorePatterns(DWORD dwmPid, bool isWin11, bool is24h2, bool is
     cfg->version = DITHER_CONFIG_VERSION;
     cfg->ditherBits = (UINT32)ditherBits;
     cfg->isWindows11 = isWin11 ? 1 : 0;
+    cfg->isWindows11_24h2 = is24h2 ? 1 : 0; // is24h2 is true for both 24H2 and 25H2
 
     // Select runtime offsets for this OS version
     if (is24h2) // includes 25H2
@@ -2682,6 +2684,7 @@ static void RunProbeMode(bool verbose)
                 cfg.hwProtOffset = ps.hwProtOffset;
                 cfg.swapChainOffset = ps.swapChainOffset;
                 cfg.isWindows11 = ps.isWin11 ? 1 : 0;
+                cfg.isWindows11_24h2 = (ps.hwProtOffset == OVERLAY_HWPROT_OFFSET_W11_24H2) ? 1 : 0;
                 cfg.ditherBits = 0;
 
                 HANDLE hCfg = CreateFileW(cfgPath.c_str(), GENERIC_WRITE, 0, NULL,
@@ -3515,6 +3518,16 @@ static bool DeployAndInjectDither(bool verbose, int ditherBits = 0)
         if (verbose)
             wprintf(L"    Config written: present=0x%llx directflip=0x%llx overlays=0x%llx\n",
                     (UINT64)cfg.presentOffset, (UINT64)cfg.directFlipOffset, (UINT64)cfg.overlaysOffset);
+    }
+
+    // Pre-create diag log with cleared DACL so the DLL can write to it from DWM's context
+    {
+        std::wstring diagPath = tempDir + L"ApplyIccLut_dither_diag.log";
+        HANDLE hDiag = CreateFileW(diagPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hDiag != INVALID_HANDLE_VALUE)
+            CloseHandle(hDiag);
+        ClearFileDacl(diagPath.c_str());
     }
 
     // Inject into all DWM processes in our session
