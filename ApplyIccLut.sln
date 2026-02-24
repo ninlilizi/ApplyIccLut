@@ -5,6 +5,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ApplyIccLut", "ApplyIccLut\ApplyIccLut.vcxproj", "{3F8A2E7B-C4D1-4E5F-9A6B-8D7C2E1F0A3B}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DitherDll", "DitherDll\DitherDll.vcxproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -15,6 +17,10 @@ Global
 		{3F8A2E7B-C4D1-4E5F-9A6B-8D7C2E1F0A3B}.Debug|x64.Build.0 = Debug|x64
 		{3F8A2E7B-C4D1-4E5F-9A6B-8D7C2E1F0A3B}.Release|x64.ActiveCfg = Release|x64
 		{3F8A2E7B-C4D1-4E5F-9A6B-8D7C2E1F0A3B}.Release|x64.Build.0 = Release|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|x64.ActiveCfg = Debug|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|x64.Build.0 = Debug|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|x64.ActiveCfg = Release|x64
+		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
