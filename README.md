@@ -26,10 +26,10 @@ This is the same mechanism used by Windows Color Management in Settings. The `-s
 
 ### 3. Hardware Dithering (NvAPI)
 
-On NVIDIA GPUs, enables hardware spatial dithering at the display output stage via the undocumented `NvAPI_GPU_SetDitherControl` API. This operates **after** ICC/color management in the GPU pipeline, reducing visible banding artifacts in gradients caused by quantization to the display's native bit depth.
+On NVIDIA GPUs, enables hardware dithering at the display output stage via the undocumented `NvAPI_GPU_SetDitherControl` API. This operates **after** ICC/color management in the GPU pipeline, reducing visible banding artifacts in gradients caused by quantization to the display's native bit depth.
 
 - **Supported bit depths**: 6-bit, 8-bit (default), 10-bit
-- **Dither mode**: Spatial dynamic (varies per frame to minimize visible patterns)
+- **Dither modes**: `temporal` (default), `spatial`, `spatial-static`, `spatial2x2`, `spatial-static-2x2`
 - **Persistence**: The setting is applied directly to the GPU hardware and persists until reset. A flag file enables automatic re-application at boot via Task Scheduler.
 
 On non-NVIDIA systems, falls back to DWM injection (blue-noise shader post-process via `dwmcore.dll` hooking). The DWM fallback is adapted from [dwm_lut](https://github.com/lauralex/dwm_lut).
@@ -66,6 +66,7 @@ With no arguments, performs a **GPU pipeline wake-up kick on all monitors** — 
 | `--hdr` | Target HDR pipeline only (applies to `-s`, `-r`, `-R`). |
 | `-d` / `--dither` | Enable dithering (NvAPI hardware on NVIDIA, DWM injection fallback). |
 | `--dither-bits <N>` | Override dither bit depth. NvAPI supports 6, 8, 10 (default: 8). |
+| `--dither-mode <M>` | NvAPI dither mode: `temporal` (default), `spatial`, `spatial-static`, `spatial2x2`, `spatial-static-2x2`. |
 | `--no-dither` | Disable dithering (resets NvAPI and removes DWM injection). |
 | `-v` | Verbose output (ramp samples, API details). |
 | `-h` | Show help. |
@@ -110,6 +111,9 @@ ApplyIccLut.exe --dither --dither-bits 6
 
 # Enable 10-bit dithering (for 10-bit HDR panels)
 ApplyIccLut.exe --dither --dither-bits 10
+
+# Enable spatial dynamic dithering instead of temporal
+ApplyIccLut.exe --dither --dither-mode spatial
 ```
 
 ## Administrator Privileges
@@ -170,7 +174,7 @@ The GPU ColorProfile APIs (`ColorProfileAddDisplayAssociation`, `ColorProfileRem
 - The `-s` wake-up kick works by removing and re-adding the profile as the default, which forces the GPU driver to re-read and apply it.
 - The pre-flight ramp check compares the current gamma ramp against both identity and the target LUT to avoid double-application.
 - `.cube` is primarily a 3D LUT format (IRIDAS/Adobe), but also carries optional 1D LUT data. This tool reads only the 1D portion (`LUT_1D_SIZE`); 3D-only files are rejected since `SetDeviceGammaRamp` can only apply per-channel 1D curves.
-- **NvAPI hardware dithering** uses the undocumented `NvAPI_GPU_SetDitherControl` (function ID `0xDF0DFCDD`) resolved via `nvapi_QueryInterface`. It applies spatial dynamic dithering at the display output stage, after all GPU color management. Supported bit depths are 6, 8, and 10. The API is the same one used by [novideo_srgb](https://github.com/ledoge/novideo_srgb).
+- **NvAPI hardware dithering** uses the undocumented `NvAPI_GPU_SetDitherControl` (function ID `0xDF0DFCDD`) resolved via `nvapi_QueryInterface`. It applies dithering at the display output stage, after all GPU color management. Supported bit depths are 6, 8, and 10. Modes: temporal (default), spatial-dynamic, spatial-static, spatial-dynamic-2x2, spatial-static-2x2. The API is the same one used by [novideo_srgb](https://github.com/ledoge/novideo_srgb).
 - **DWM injection fallback** (non-NVIDIA) uses blue-noise dithering via a 64x64 texture injected as a pixel shader post-process in `dwmcore.dll`. DWM hooking uses PDB symbol resolution to locate `COverlayContext::Present`, `IsCandidateDirectFlipCompatible`, and `OverlaysEnabled`. These offsets may change with Windows updates.
 - Boot persistence for dithering uses a flag file (`%SYSTEMROOT%\Temp\ApplyIccLut_dither.flag`). When the tool runs with no arguments (default GPU wake-up mode) and this flag exists, dithering is automatically re-enabled. The flag stores the method (`nvapi:` prefix for NvAPI) and bit depth.
 

@@ -2644,7 +2644,8 @@ static const char* NvApiErrorStr(NvApiContext& ctx, NvAPI_Status st)
     return buf;
 }
 
-static bool EnableNvApiDithering(int ditherBits, bool verbose)
+// ditherMode: 0=SpatialDynamic, 1=SpatialStatic, 2=SpatialDynamic2x2, 3=SpatialStatic2x2, 4=Temporal
+static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose)
 {
     NvApiContext nv;
     if (!LoadNvApi(nv, verbose))
@@ -2660,7 +2661,12 @@ static bool EnableNvApiDithering(int ditherBits, bool verbose)
     if (ditherBits != 0 && ditherBits != 6 && ditherBits != 8 && ditherBits != 10)
         wprintf(L"  NvAPI: --dither-bits %d not directly supported, using %s\n", ditherBits, bitsName);
 
-    wprintf(L"  NvAPI: enabling %s spatial dithering on all displays...\n", bitsName);
+    static const wchar_t* modeNames[] = {
+        L"spatial-dynamic", L"spatial-static", L"spatial-dynamic-2x2",
+        L"spatial-static-2x2", L"temporal"
+    };
+    NvU32 nvMode = (ditherMode >= 0 && ditherMode <= 4) ? (NvU32)ditherMode : 4;
+    wprintf(L"  NvAPI: enabling %s %s dithering on all displays...\n", bitsName, modeNames[nvMode]);
 
     int displayCount = 0;
     int successCount = 0;
@@ -2706,8 +2712,8 @@ static bool EnableNvApiDithering(int ditherBits, bool verbose)
             }
         }
 
-        // Set dither: state=Enabled(1), bits=target, mode=SpatialDynamic(0)
-        st = nv.SetDitherControl(gpus[0], outputId, 1, nvBits, 0);
+        // Set dither: state=Enabled(1), bits=target, mode=user-selected
+        st = nv.SetDitherControl(gpus[0], outputId, 1, nvBits, nvMode);
         if (st == NVAPI_OK)
         {
             successCount++;
@@ -3180,6 +3186,7 @@ int wmain(int argc, wchar_t* argv[])
     bool noDitherMode = false;
     bool probeMode   = false;
     int  ditherBits  = 0; // 0 = auto (SDR=8, HDR=10)
+    int  ditherModeVal = 4; // NvAPI dither mode: 0-4, default=4 (Temporal)
     bool targetSdr   = false;
     bool targetHdr   = false;
     bool monitorExplicit = false; // true if -m was given on the command line
@@ -3232,6 +3239,27 @@ int wmain(int argc, wchar_t* argv[])
                 return 1;
             }
         }
+        else if (wcscmp(argv[i], L"--dither-mode") == 0 && i + 1 < argc)
+        {
+            const wchar_t* modeArg = argv[++i];
+            if (_wcsicmp(modeArg, L"spatial") == 0 || _wcsicmp(modeArg, L"spatial-dynamic") == 0)
+                ditherModeVal = 0;
+            else if (_wcsicmp(modeArg, L"spatial-static") == 0)
+                ditherModeVal = 1;
+            else if (_wcsicmp(modeArg, L"spatial2x2") == 0 || _wcsicmp(modeArg, L"spatial-dynamic-2x2") == 0)
+                ditherModeVal = 2;
+            else if (_wcsicmp(modeArg, L"spatial-static-2x2") == 0)
+                ditherModeVal = 3;
+            else if (_wcsicmp(modeArg, L"temporal") == 0)
+                ditherModeVal = 4;
+            else
+            {
+                wprintf(L"Invalid dither mode: %s\n", modeArg);
+                wprintf(L"  Valid modes: temporal (default), spatial, spatial-static,\n");
+                wprintf(L"              spatial2x2, spatial-static-2x2\n");
+                return 1;
+            }
+        }
         else if ((wcscmp(argv[i], L"-p") == 0 || wcscmp(argv[i], L"--profile") == 0)
                  && i + 1 < argc)
         {
@@ -3274,6 +3302,9 @@ int wmain(int argc, wchar_t* argv[])
             wprintf(L"              Default: both SDR and HDR when neither is specified\n");
             wprintf(L"  -d          Enable dithering (NvAPI hardware on NVIDIA, DWM fallback)\n");
             wprintf(L"  --dither-bits <N>  Override dither bit depth (NvAPI: 6/8/10, default: 8)\n");
+            wprintf(L"  --dither-mode <M>  NvAPI dither mode (default: temporal)\n");
+            wprintf(L"              Modes: temporal, spatial, spatial-static,\n");
+            wprintf(L"                     spatial2x2, spatial-static-2x2\n");
             wprintf(L"  --no-dither Disable dithering (resets NvAPI + removes DWM injection)\n");
             wprintf(L"  -v          Verbose output\n");
             wprintf(L"  -h          Show this help\n\n");
@@ -3289,8 +3320,9 @@ int wmain(int argc, wchar_t* argv[])
             wprintf(L"  Profile must exist in: %%WINDIR%%\\system32\\spool\\drivers\\color\n\n");
             wprintf(L"Dithering (-d / --no-dither):\n");
             wprintf(L"  On NVIDIA GPUs, uses NvAPI hardware dithering at the display\n");
-            wprintf(L"  output stage (spatial dithering, after ICC color management).\n");
-            wprintf(L"  Supported bit depths: 6, 8, 10 (default: 8).\n");
+            wprintf(L"  output stage (after ICC color management).\n");
+            wprintf(L"  Bit depths: 6, 8, 10 (default: 8). Modes: temporal (default),\n");
+            wprintf(L"  spatial, spatial-static, spatial2x2, spatial-static-2x2.\n");
             wprintf(L"  Falls back to DWM injection (blue-noise shader) on non-NVIDIA\n");
             wprintf(L"  or older systems. Use --no-dither to disable. Automatically\n");
             wprintf(L"  re-enabled at boot with the GPU wake-up (Task Scheduler).\n\n");
@@ -3320,15 +3352,16 @@ int wmain(int argc, wchar_t* argv[])
     {
         // Try NvAPI hardware dithering first (NVIDIA GPUs)
         wprintf(L"Dithering: attempting NvAPI hardware dithering...\n");
-        if (EnableNvApiDithering(ditherBits, verbose))
+        if (EnableNvApiDithering(ditherBits, ditherModeVal, verbose))
         {
             // Write flag file for boot persistence with "nvapi:" prefix
+            // Format: "nvapi:<bits>,<mode>"
             std::wstring flagPath = GetSystemTempPath() + DITHER_FLAG_FILE;
             HANDLE hFlag = CreateFileW(flagPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFlag != INVALID_HANDLE_VALUE)
             {
                 char buf[32];
-                int len = wsprintfA(buf, "nvapi:%d", ditherBits);
+                int len = wsprintfA(buf, "nvapi:%d,%d", ditherBits, ditherModeVal);
                 DWORD written;
                 WriteFile(hFlag, buf, len, &written, NULL);
                 CloseHandle(hFlag);
@@ -3371,7 +3404,9 @@ int wmain(int argc, wchar_t* argv[])
         if (IsDitherFlagSet())
         {
             // Read stored dither settings from flag file
+            // Format: "nvapi:<bits>,<mode>" or just "<bits>" for DWM
             int storedBits = 0;
+            int storedMode = 4; // default: Temporal
             bool storedNvApi = false;
             {
                 std::wstring flagPath = GetSystemTempPath() + DITHER_FLAG_FILE;
@@ -3386,11 +3421,23 @@ int wmain(int argc, wchar_t* argv[])
                     if (bytesRead >= 6 && memcmp(buf, "nvapi:", 6) == 0)
                     {
                         storedNvApi = true;
+                        // Parse bits
                         int val = 0;
-                        for (DWORD j = 6; j < bytesRead && buf[j] >= '0' && buf[j] <= '9'; j++)
+                        DWORD j = 6;
+                        for (; j < bytesRead && buf[j] >= '0' && buf[j] <= '9'; j++)
                             val = val * 10 + (buf[j] - '0');
                         if (val > 0 && val <= 16)
                             storedBits = val;
+                        // Parse mode after comma
+                        if (j < bytesRead && buf[j] == ',')
+                        {
+                            j++;
+                            int mval = 0;
+                            for (; j < bytesRead && buf[j] >= '0' && buf[j] <= '9'; j++)
+                                mval = mval * 10 + (buf[j] - '0');
+                            if (mval >= 0 && mval <= 4)
+                                storedMode = mval;
+                        }
                     }
                     else
                     {
@@ -3406,7 +3453,7 @@ int wmain(int argc, wchar_t* argv[])
             if (storedNvApi)
             {
                 wprintf(L"Dithering: re-enabling NvAPI hardware dithering (flag file present)...\n");
-                EnableNvApiDithering(storedBits, verbose);
+                EnableNvApiDithering(storedBits, storedMode, verbose);
                 wprintf(L"\n");
             }
             else if (!IsDitherAlreadyInjected())
