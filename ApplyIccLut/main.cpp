@@ -20,8 +20,8 @@
 //   ApplyIccLut.exe -s Profile.icm  Set installed profile as GPU default (4096)
 //   ApplyIccLut.exe -v              Verbose output
 //   ApplyIccLut.exe -r              Reset to linear (identity) gamma ramp
-//   ApplyIccLut.exe --probe         Discover dithering offsets for this dwmcore.dll
-//   ApplyIccLut.exe --probe -v      Verbose offset discovery with all candidates
+//   ApplyIccLut.exe --probe         Force re-download PDB and re-resolve offsets
+//   ApplyIccLut.exe --probe -v      Verbose PDB resolution output
 
 #include <windows.h>
 #include <icm.h>
@@ -38,6 +38,11 @@
 #pragma comment(lib, "mscms.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "urlmon.lib")
+
+#include <DbgHelp.h>
+#include <urlmon.h>
 
 // ============================================================================
 // Big-endian helpers (ICC profiles are big-endian)
@@ -1527,116 +1532,14 @@ static std::wstring GetSystemTempPath()
 // ============================================================================
 
 // AOB pattern matching (returns false on match, true on mismatch — same as DLL)
-static bool aob_match_inverse(const unsigned char* buf, const unsigned char* mask, int len)
-{
-    for (int i = 0; i < len; ++i)
-    {
-        if (buf[i] != mask[i] && mask[i] != '?')
-            return true;
-    }
-    return false;
-}
-
-// All AOB patterns
-// Windows 10
-static const unsigned char pat_present_w10[] = {
-    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x40, 0x48, 0x8b, 0xb1, 0x20,
-    0x2c, 0x00, 0x00, 0x45, 0x8b, 0xd0, 0x48, 0x8b, 0xfa, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xf6, 0x0f, 0x85
-};
-static const unsigned char pat_directflip_w10[] = {
-    0x48, 0x89, 0x7c, 0x24, 0x20, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8b, 0xec, 0x48, 0x83,
-    0xec, 0x40
-};
-static const unsigned char pat_overlays_w10[] = {
-    0x75, 0x04, 0x32, 0xc0, 0xc3, 0xcc, 0x83, 0x79, 0x30, 0x01, 0x0f, 0x97, 0xc0, 0xc3
-};
-
-// Windows 11 (pre-24H2)
-static const unsigned char pat_present_w11[] = {
-    0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
-    '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x78, 0x48
-};
-static const unsigned char pat_directflip_w11[] = {
-    0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC,
-    0x68, 0x48,
-};
-static const unsigned char pat_overlays_w11[] = {
-    0x83, 0x3D, '?', '?', '?', '?', '?', 0x75, 0x04
-};
-
-// Windows 11 24H2 (build >= 26100)
-static const unsigned char pat_present_w11_24h2[] = {
-    0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x90, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
-    '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x80, 0x48
-};
-static const unsigned char pat_directflip_w11_24h2[] = {
-    0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC,
-    0x70, 0x48,
-};
-static const unsigned char pat_overlays_w11_24h2[] = {
-    0x83, 0x3D, '?', '?', '?', '?', '?', 0x74, 0x04
-};
-
-// Windows 11 25H2 (build >= 26200)
-static const unsigned char pat_present_w11_25h2[] = {
-    0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x68, 0x48, 0x8B, 0x05,
-    '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x50
-};
-static const unsigned char pat_directflip_w11_25h2[] = {
-    0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC,
-    0x78, 0x48,
-};
-static const unsigned char pat_overlays_w11_25h2[] = {
-    0x48, 0x8B, 0x41, 0x38, 0x48, 0x85, 0xC0, 0x75, 0x04, 0x32, 0xC0, 0xC3
-};
-
 // IOverlaySwapChain offsets (version-specific, passed to DLL via config)
+// These are struct member offsets that PDB symbols don't provide.
 static const int OVERLAY_SWAPCHAIN_OFFSET_W10     = -0x118;
 static const int OVERLAY_SWAPCHAIN_OFFSET_W11     = 0xE0;
 static const int OVERLAY_SWAPCHAIN_OFFSET_W11_24H2 = 0x108; // 24H2+: direct offset on overlaySwapChain
 static const int OVERLAY_HWPROT_OFFSET_W10     = -0xbc;
 static const int OVERLAY_HWPROT_OFFSET_W11     = -0x144;
 static const int OVERLAY_HWPROT_OFFSET_W11_24H2 = 0x64;   // 24H2+: direct offset on overlaySwapChain
-
-// ============================================================================
-// Cross-version pattern sets for --probe mode
-// ============================================================================
-
-struct PatternSet {
-    const char* label;
-    const unsigned char *present, *directFlip, *overlays;
-    int presentLen, directFlipLen, overlaysLen;
-    bool isWin11;
-    int hwProtOffset, swapChainOffset;
-};
-
-static const PatternSet ALL_PATTERNS[] = {
-    {
-        "Win10",
-        pat_present_w10,      pat_directflip_w10,      pat_overlays_w10,
-        sizeof(pat_present_w10), sizeof(pat_directflip_w10), sizeof(pat_overlays_w10),
-        false, OVERLAY_HWPROT_OFFSET_W10, OVERLAY_SWAPCHAIN_OFFSET_W10
-    },
-    {
-        "Win11 (pre-24H2)",
-        pat_present_w11,      pat_directflip_w11,      pat_overlays_w11,
-        sizeof(pat_present_w11), sizeof(pat_directflip_w11), sizeof(pat_overlays_w11),
-        true, OVERLAY_HWPROT_OFFSET_W11, OVERLAY_SWAPCHAIN_OFFSET_W11
-    },
-    {
-        "Win11 24H2",
-        pat_present_w11_24h2, pat_directflip_w11_24h2, pat_overlays_w11_24h2,
-        sizeof(pat_present_w11_24h2), sizeof(pat_directflip_w11_24h2), sizeof(pat_overlays_w11_24h2),
-        true, OVERLAY_HWPROT_OFFSET_W11_24H2, OVERLAY_SWAPCHAIN_OFFSET_W11_24H2
-    },
-    {
-        "Win11 25H2",
-        pat_present_w11_25h2, pat_directflip_w11_25h2, pat_overlays_w11_25h2,
-        sizeof(pat_present_w11_25h2), sizeof(pat_directflip_w11_25h2), sizeof(pat_overlays_w11_25h2),
-        true, OVERLAY_HWPROT_OFFSET_W11_24H2, OVERLAY_SWAPCHAIN_OFFSET_W11_24H2
-    },
-};
-static const int NUM_PATTERN_SETS = sizeof(ALL_PATTERNS) / sizeof(ALL_PATTERNS[0]);
 
 // Binary config struct shared with DitherDll (must match exactly)
 #pragma pack(push, 1)
@@ -1680,7 +1583,7 @@ struct OffsetCacheEntry {
     INT32  hwProtOffset;
     INT32  swapChainOffset;
     UINT32 isWindows11;
-    UINT32 sourceFlags;         // 1=formal AOB, 2=probe-discovered
+    UINT32 sourceFlags;         // 1=PDB-resolved
 };
 #pragma pack(pop)
 
@@ -1755,6 +1658,332 @@ static bool SaveOffsetCache(const OffsetCacheEntry* entry)
     return ok && written == sizeof(*entry);
 }
 
+// ============================================================================
+// PDB symbol resolution — download dwmcore.pdb from Microsoft Symbol Server
+// and resolve COverlayContext function RVAs by name.
+// ============================================================================
+
+struct PdbResolvedOffsets {
+    INT64 presentRva;
+    INT64 directFlipRva;
+    INT64 overlaysRva;
+    bool presentFound;
+    bool directFlipFound;
+    bool overlaysFound;
+};
+
+struct SymEnumCtx {
+    PdbResolvedOffsets* offsets;
+    DWORD64 moduleBase;
+    bool verbose;
+    int totalCount;
+};
+
+static BOOL CALLBACK PdbSymEnumCallback(PSYMBOL_INFO pSymInfo, ULONG SymbolSize, PVOID UserContext)
+{
+    auto ctx = (SymEnumCtx*)UserContext;
+    DWORD64 rva = pSymInfo->Address - ctx->moduleBase;
+    ctx->totalCount++;
+
+    if (ctx->verbose)
+        wprintf(L"    PDB sym: %S @ RVA 0x%llx\n", pSymInfo->Name, (UINT64)rva);
+
+    // Match exactly "::Present" — the method name must end there (no PresentOverlay, etc.)
+    {
+        const char* match = strstr(pSymInfo->Name, "::Present");
+        if (match)
+        {
+            char after = match[9]; // character after "::Present"
+            if (after == '\0' || after == '(' || after == '@' || after == ' ')
+            {
+                wprintf(L"    PDB: >> Present candidate @ RVA 0x%llx (%S)\n", (UINT64)rva, pSymInfo->Name);
+                if (!ctx->offsets->presentFound) {
+                    ctx->offsets->presentRva = (INT64)rva;
+                    ctx->offsets->presentFound = true;
+                }
+            }
+        }
+    }
+
+    // Match "::IsCandidateDirectFlipCompat" — require :: prefix for exact method name
+    if (strstr(pSymInfo->Name, "::IsCandidateDirectFlipCompat"))
+    {
+        wprintf(L"    PDB: >> DirectFlip candidate @ RVA 0x%llx (%S)\n", (UINT64)rva, pSymInfo->Name);
+        if (!ctx->offsets->directFlipFound) {
+            ctx->offsets->directFlipRva = (INT64)rva;
+            ctx->offsets->directFlipFound = true;
+        }
+    }
+
+    // Match exactly "::OverlaysEnabled" — exclude RGBOverlaysEnabled etc.
+    {
+        const char* match = strstr(pSymInfo->Name, "OverlaysEnabled");
+        if (match && match >= pSymInfo->Name + 2 &&
+            match[-1] == ':' && match[-2] == ':')
+        {
+            wprintf(L"    PDB: >> OverlaysEnabled candidate @ RVA 0x%llx (%S)\n", (UINT64)rva, pSymInfo->Name);
+            if (!ctx->offsets->overlaysFound) {
+                ctx->offsets->overlaysRva = (INT64)rva;
+                ctx->offsets->overlaysFound = true;
+            }
+        }
+    }
+
+    return TRUE;
+}
+
+// ============================================================================
+// PDB download via HTTP — parse PE debug directory for GUID, download from
+// Microsoft Symbol Server, then load locally with system dbghelp.dll.
+// No SDK dependencies required.
+// ============================================================================
+
+// Extract PDB GUID and age from a PE file's debug directory
+struct PdbInfo {
+    GUID guid;
+    DWORD age;
+    char pdbName[MAX_PATH];
+    bool valid;
+};
+
+static PdbInfo GetPdbInfoFromDll(const wchar_t* dllPath)
+{
+    PdbInfo info = {};
+
+    HANDLE hFile = CreateFileW(dllPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return info;
+
+    HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return info; }
+
+    const unsigned char* base = (const unsigned char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!base) { CloseHandle(hMap); CloseHandle(hFile); return info; }
+
+    // Parse PE headers
+    const IMAGE_DOS_HEADER* dosHdr = (const IMAGE_DOS_HEADER*)base;
+    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) goto done;
+
+    {
+        const IMAGE_NT_HEADERS64* ntHdr = (const IMAGE_NT_HEADERS64*)(base + dosHdr->e_lfanew);
+        if (ntHdr->Signature != IMAGE_NT_SIGNATURE) goto done;
+
+        DWORD debugRva = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress;
+        DWORD debugSize = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+        if (!debugRva || !debugSize) goto done;
+
+        // Convert RVA to file offset using section headers
+        const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(ntHdr);
+        DWORD debugFileOffset = 0;
+        for (WORD i = 0; i < ntHdr->FileHeader.NumberOfSections; i++)
+        {
+            if (debugRva >= sections[i].VirtualAddress &&
+                debugRva < sections[i].VirtualAddress + sections[i].SizeOfRawData)
+            {
+                debugFileOffset = debugRva - sections[i].VirtualAddress + sections[i].PointerToRawData;
+                break;
+            }
+        }
+        if (!debugFileOffset) goto done;
+
+        int numEntries = debugSize / sizeof(IMAGE_DEBUG_DIRECTORY);
+        auto debugDir = (const IMAGE_DEBUG_DIRECTORY*)(base + debugFileOffset);
+
+        for (int i = 0; i < numEntries; i++)
+        {
+            if (debugDir[i].Type == IMAGE_DEBUG_TYPE_CODEVIEW)
+            {
+                const unsigned char* cvData = base + debugDir[i].PointerToRawData;
+                // CV_INFO_PDB70: signature "RSDS" + GUID(16) + age(4) + filename
+                if (cvData[0] == 'R' && cvData[1] == 'S' && cvData[2] == 'D' && cvData[3] == 'S')
+                {
+                    memcpy(&info.guid, cvData + 4, sizeof(GUID));
+                    info.age = *(const DWORD*)(cvData + 20);
+                    lstrcpynA(info.pdbName, (const char*)(cvData + 24), MAX_PATH);
+                    info.valid = true;
+                }
+                break;
+            }
+        }
+    } // ntHdr scope
+
+done:
+    UnmapViewOfFile(base);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    return info;
+}
+
+static bool DownloadPdbFromSymbolServer(const PdbInfo& pdbInfo, const char* localDir, char* outPath)
+{
+    // Format GUID as uppercase hex without dashes (32 chars)
+    char guidStr[64];
+    wsprintfA(guidStr, "%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X%d",
+              pdbInfo.guid.Data1, pdbInfo.guid.Data2, pdbInfo.guid.Data3,
+              pdbInfo.guid.Data4[0], pdbInfo.guid.Data4[1],
+              pdbInfo.guid.Data4[2], pdbInfo.guid.Data4[3],
+              pdbInfo.guid.Data4[4], pdbInfo.guid.Data4[5],
+              pdbInfo.guid.Data4[6], pdbInfo.guid.Data4[7],
+              pdbInfo.age);
+
+    // Build local path: <cache>/<pdbname>/<guidStr>/<pdbname>
+    char subDir[MAX_PATH];
+    wsprintfA(subDir, "%s\\%s", localDir, pdbInfo.pdbName);
+    CreateDirectoryA(subDir, NULL);
+    wsprintfA(subDir, "%s\\%s\\%s", localDir, pdbInfo.pdbName, guidStr);
+    CreateDirectoryA(subDir, NULL);
+
+    wsprintfA(outPath, "%s\\%s", subDir, pdbInfo.pdbName);
+
+    // Check if already cached
+    if (GetFileAttributesA(outPath) != INVALID_FILE_ATTRIBUTES)
+    {
+        wprintf(L"    PDB: Using cached %S\n", outPath);
+        return true;
+    }
+
+    // Download from symbol server
+    char url[1024];
+    wsprintfA(url, "https://msdl.microsoft.com/download/symbols/%s/%s/%s",
+              pdbInfo.pdbName, guidStr, pdbInfo.pdbName);
+
+    wprintf(L"    PDB: Downloading %S\n", url);
+    HRESULT hr = URLDownloadToFileA(NULL, url, outPath, 0, NULL);
+    if (FAILED(hr))
+    {
+        wprintf(L"    PDB: Download failed (hr=0x%08X)\n", hr);
+        DeleteFileA(outPath);
+        return false;
+    }
+
+    wprintf(L"    PDB: Downloaded to %S\n", outPath);
+    return true;
+}
+
+static PdbResolvedOffsets ResolveDwmcorePdb(bool verbose)
+{
+    PdbResolvedOffsets result = {};
+
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+    std::wstring dllPath = std::wstring(sysDir) + L"\\dwmcore.dll";
+
+    wprintf(L"    PDB: Resolving symbols for %s\n", dllPath.c_str());
+
+    // Step 1: Extract PDB GUID from dwmcore.dll PE headers
+    PdbInfo pdbInfo = GetPdbInfoFromDll(dllPath.c_str());
+    if (!pdbInfo.valid)
+    {
+        wprintf(L"    PDB: Could not extract PDB info from PE debug directory\n");
+        return result;
+    }
+    wprintf(L"    PDB: %S GUID={%08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X} age=%u\n",
+            pdbInfo.pdbName,
+            pdbInfo.guid.Data1, pdbInfo.guid.Data2, pdbInfo.guid.Data3,
+            pdbInfo.guid.Data4[0], pdbInfo.guid.Data4[1],
+            pdbInfo.guid.Data4[2], pdbInfo.guid.Data4[3],
+            pdbInfo.guid.Data4[4], pdbInfo.guid.Data4[5],
+            pdbInfo.guid.Data4[6], pdbInfo.guid.Data4[7],
+            pdbInfo.age);
+
+    // Step 2: Download PDB from symbol server
+    char localCache[MAX_PATH];
+    ExpandEnvironmentStringsA("%LOCALAPPDATA%\\Temp\\SymbolCache", localCache, MAX_PATH);
+    CreateDirectoryA(localCache, NULL);
+
+    char pdbPath[MAX_PATH];
+    if (!DownloadPdbFromSymbolServer(pdbInfo, localCache, pdbPath))
+        return result;
+
+    // Step 3: Load symbols from the local PDB with system dbghelp.dll
+    DWORD opts = SymGetOptions();
+    SymSetOptions((opts | SYMOPT_UNDNAME | SYMOPT_AUTO_PUBLICS) & ~SYMOPT_DEFERRED_LOADS);
+
+    HANDLE hSym = (HANDLE)(uintptr_t)0xDEAD0001;
+
+    // Point symbol path at the directory containing the downloaded PDB
+    char pdbDir[MAX_PATH];
+    lstrcpynA(pdbDir, pdbPath, MAX_PATH);
+    char* lastSlash = strrchr(pdbDir, '\\');
+    if (lastSlash) *lastSlash = '\0';
+
+    if (!SymInitialize(hSym, pdbDir, FALSE))
+    {
+        wprintf(L"    PDB: SymInitialize failed (err=%lu)\n", GetLastError());
+        SymSetOptions(opts);
+        return result;
+    }
+
+    char dllPathA[MAX_PATH];
+    WideCharToMultiByte(CP_ACP, 0, dllPath.c_str(), -1, dllPathA, MAX_PATH, NULL, NULL);
+
+    DWORD64 baseAddr = SymLoadModuleEx(hSym, NULL, dllPathA, NULL, 0x10000000, 0, NULL, 0);
+    if (!baseAddr)
+    {
+        wprintf(L"    PDB: SymLoadModuleEx failed (err=%lu)\n", GetLastError());
+        SymCleanup(hSym);
+        SymSetOptions(opts);
+        return result;
+    }
+
+    // Verify we got PDB symbols (not just exports)
+    IMAGEHLP_MODULE64 modInfo = {};
+    modInfo.SizeOfStruct = sizeof(modInfo);
+    if (SymGetModuleInfo64(hSym, baseAddr, &modInfo))
+    {
+        wprintf(L"    PDB: SymType=%d (%S)\n",
+                modInfo.SymType,
+                modInfo.SymType == SymPdb ? "PDB" :
+                modInfo.SymType == SymExport ? "Export-only" :
+                modInfo.SymType == SymNone ? "None" : "Other");
+    }
+
+    // Count total symbols
+    int totalSymCount = 0;
+    SymEnumSymbols(hSym, baseAddr, "*", [](PSYMBOL_INFO, ULONG, PVOID ctx) -> BOOL {
+        (*(int*)ctx)++; return TRUE;
+    }, &totalSymCount);
+    wprintf(L"    PDB: Total symbols: %d\n", totalSymCount);
+
+    if (totalSymCount <= 10)
+    {
+        wprintf(L"    PDB: Too few symbols -- PDB may not have loaded correctly\n");
+        SymUnloadModule64(hSym, baseAddr);
+        SymCleanup(hSym);
+        SymSetOptions(opts);
+        return result;
+    }
+
+    // Search for COverlayContext symbols
+    SymEnumCtx ctx = { &result, baseAddr, verbose, 0 };
+    SymEnumSymbols(hSym, baseAddr, "*COverlayContext*", PdbSymEnumCallback, &ctx);
+    wprintf(L"    PDB: Matched %d COverlayContext symbols\n", ctx.totalCount);
+
+    // Retry with decorated names if needed
+    if (ctx.totalCount == 0)
+    {
+        SymSetOptions((opts | SYMOPT_AUTO_PUBLICS) & ~(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME));
+        SymUnloadModule64(hSym, baseAddr);
+        baseAddr = SymLoadModuleEx(hSym, NULL, dllPathA, NULL, 0x10000000, 0, NULL, 0);
+        if (baseAddr)
+        {
+            ctx.totalCount = 0;
+            SymEnumSymbols(hSym, baseAddr, "*COverlayContext*", PdbSymEnumCallback, &ctx);
+            wprintf(L"    PDB: Matched %d symbols (decorated)\n", ctx.totalCount);
+        }
+    }
+
+    SymUnloadModule64(hSym, baseAddr);
+    SymCleanup(hSym);
+    SymSetOptions(opts);
+
+    wprintf(L"    PDB: Present=%s DirectFlip=%s Overlays=%s\n",
+            result.presentFound ? L"FOUND" : L"NOT FOUND",
+            result.directFlipFound ? L"FOUND" : L"NOT FOUND",
+            result.overlaysFound ? L"FOUND" : L"NOT FOUND");
+
+    return result;
+}
+
 // Scan dwmcore.dll in a remote dwm.exe process for hook target patterns.
 // Returns true if all 3 patterns found, filling cfg with offsets and runtime params.
 static bool ScanDwmcorePatterns(DWORD dwmPid, bool isWin11, bool is24h2, bool is25h2,
@@ -1784,674 +2013,45 @@ static bool ScanDwmcorePatterns(DWORD dwmPid, bool isWin11, bool is24h2, bool is
         cfg->swapChainOffset = OVERLAY_SWAPCHAIN_OFFSET_W10;
     }
 
-    // Open dwm.exe and find dwmcore.dll
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, dwmPid);
-    if (!hProcess)
+    // Resolve function offsets via PDB symbols from Microsoft Symbol Server
+    wprintf(L"    --- PDB Symbol Resolution ---\n");
+    PdbResolvedOffsets pdb = ResolveDwmcorePdb(false);
+
+    if (pdb.presentFound && pdb.directFlipFound && pdb.overlaysFound)
     {
-        wprintf(L"    Could not open dwm.exe for scanning (err=%lu)\n", GetLastError());
-        return false;
+        cfg->presentOffset = pdb.presentRva;
+        cfg->directFlipOffset = pdb.directFlipRva;
+        cfg->overlaysOffset = pdb.overlaysRva;
+        wprintf(L"    PDB: Present=0x%llx DirectFlip=0x%llx Overlays=0x%llx\n",
+                (UINT64)pdb.presentRva, (UINT64)pdb.directFlipRva, (UINT64)pdb.overlaysRva);
+        return true;
     }
 
-    HMODULE dwmcoreBase = NULL;
-    DWORD dwmcoreSize = 0;
-    {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, dwmPid);
-        if (snap != INVALID_HANDLE_VALUE)
-        {
-            MODULEENTRY32W me = {};
-            me.dwSize = sizeof(me);
-            if (Module32FirstW(snap, &me))
-            {
-                do {
-                    if (_wcsicmp(me.szModule, L"dwmcore.dll") == 0)
-                    {
-                        dwmcoreBase = me.hModule;
-                        dwmcoreSize = me.modBaseSize;
-                        break;
-                    }
-                } while (Module32NextW(snap, &me));
-            }
-            CloseHandle(snap);
-        }
-    }
-
-    if (!dwmcoreBase || dwmcoreSize == 0)
-    {
-        wprintf(L"    dwmcore.dll not found in dwm.exe\n");
-        CloseHandle(hProcess);
-        return false;
-    }
-
-    wprintf(L"    dwmcore.dll: base=0x%llx size=%lu\n", (UINT64)dwmcoreBase, dwmcoreSize);
-
-    // Read the module image
-    std::vector<unsigned char> image(dwmcoreSize);
-    SIZE_T bytesRead = 0;
-    ReadProcessMemory(hProcess, dwmcoreBase, image.data(), dwmcoreSize, &bytesRead);
-    CloseHandle(hProcess);
-
-    if (bytesRead == 0)
-    {
-        wprintf(L"    Could not read dwmcore.dll memory\n");
-        return false;
-    }
-
-    size_t imageSize = bytesRead;
-
-    // Select patterns for version
-    const unsigned char* presentPat;   int presentLen;
-    const unsigned char* directFlipPat; int directFlipLen;
-    const unsigned char* overlaysPat;  int overlaysLen;
-
-    if (is25h2)
-    {
-        presentPat = pat_present_w11_25h2;     presentLen = sizeof(pat_present_w11_25h2);
-        directFlipPat = pat_directflip_w11_25h2; directFlipLen = sizeof(pat_directflip_w11_25h2);
-        overlaysPat = pat_overlays_w11_25h2;   overlaysLen = sizeof(pat_overlays_w11_25h2);
-    }
-    else if (is24h2)
-    {
-        presentPat = pat_present_w11_24h2;     presentLen = sizeof(pat_present_w11_24h2);
-        directFlipPat = pat_directflip_w11_24h2; directFlipLen = sizeof(pat_directflip_w11_24h2);
-        overlaysPat = pat_overlays_w11_24h2;   overlaysLen = sizeof(pat_overlays_w11_24h2);
-    }
-    else if (isWin11)
-    {
-        presentPat = pat_present_w11;          presentLen = sizeof(pat_present_w11);
-        directFlipPat = pat_directflip_w11;    directFlipLen = sizeof(pat_directflip_w11);
-        overlaysPat = pat_overlays_w11;        overlaysLen = sizeof(pat_overlays_w11);
-    }
-    else
-    {
-        presentPat = pat_present_w10;          presentLen = sizeof(pat_present_w10);
-        directFlipPat = pat_directflip_w10;    directFlipLen = sizeof(pat_directflip_w10);
-        overlaysPat = pat_overlays_w10;        overlaysLen = sizeof(pat_overlays_w10);
-    }
-
-    // Scan for patterns
-    bool foundPresent = false, foundDirectFlip = false, foundOverlays = false;
-
-    for (size_t i = 0; i < imageSize; i++)
-    {
-        if (!foundPresent && i + presentLen <= imageSize &&
-            !aob_match_inverse(image.data() + i, presentPat, presentLen))
-        {
-            foundPresent = true;
-            cfg->presentOffset = (INT64)i;
-            wprintf(L"    Found Present at offset 0x%llx\n", (UINT64)i);
-        }
-        else if (!foundDirectFlip && i + directFlipLen <= imageSize &&
-                 !aob_match_inverse(image.data() + i, directFlipPat, directFlipLen))
-        {
-            foundDirectFlip = true;
-            cfg->directFlipOffset = (INT64)i;
-            wprintf(L"    Found DirectFlip at offset 0x%llx\n", (UINT64)i);
-        }
-        else if (!foundOverlays && i + overlaysLen <= imageSize &&
-                 !aob_match_inverse(image.data() + i, overlaysPat, overlaysLen))
-        {
-            foundOverlays = true;
-            cfg->overlaysOffset = (INT64)i;
-            wprintf(L"    Found OverlaysEnabled at offset 0x%llx\n", (UINT64)i);
-        }
-
-        if (foundPresent && foundDirectFlip && foundOverlays)
-            break;
-    }
-
-    if (!foundPresent)   wprintf(L"    ERROR: Present pattern not found\n");
-    if (!foundDirectFlip) wprintf(L"    ERROR: DirectFlip pattern not found\n");
-    if (!foundOverlays)  wprintf(L"    ERROR: OverlaysEnabled pattern not found\n");
-
-    return foundPresent && foundDirectFlip && foundOverlays;
+    wprintf(L"    PDB: incomplete (%s%s%s)\n",
+            pdb.presentFound ? L"" : L"Present ",
+            pdb.directFlipFound ? L"" : L"DirectFlip ",
+            pdb.overlaysFound ? L"" : L"Overlays ");
+    wprintf(L"    ERROR: PDB symbol resolution failed to find all required functions.\n");
+    wprintf(L"    TIP: Run 'ApplyIccLut.exe --probe' to force re-download the PDB.\n");
+    return false;
 }
 
-static void DiagLogPrintf(FILE* f, const char* fmt, ...)
-{
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fprintf(f, "\n");
-}
-
-static void DiagLogBytes(FILE* f, const char* prefix, const unsigned char* bytes, size_t len)
-{
-    fprintf(f, "  %s", prefix);
-    for (size_t i = 0; i < len && i < 48; i++)
-        fprintf(f, "%02x ", bytes[i]);
-    if (len > 48) fprintf(f, "...");
-    fprintf(f, "\n");
-}
-
-static void RunRemoteDiagnostics(DWORD dwmPid, bool isWin11, bool is24h2, bool is25h2)
-{
-    std::wstring logPath = GetSystemTempPath() + L"ApplyIccLut_dither_diag.log";
-    FILE* f = NULL;
-    if (_wfopen_s(&f, logPath.c_str(), L"a") != 0 || !f)
-    {
-        wprintf(L"  Could not open diagnostic log for writing.\n");
-        return;
-    }
-
-    WindowsVersion diagVer = GetTrueWindowsVersion();
-    DiagLogPrintf(f, "=== Remote Diagnostic Scan (from main app) ===");
-    DiagLogPrintf(f, "Target: dwm.exe PID %lu", dwmPid);
-    DiagLogPrintf(f, "OS: %s (build %lu)",
-        is25h2 ? "Windows 11 25H2+" :
-        is24h2 ? "Windows 11 24H2" :
-        isWin11 ? "Windows 11 (pre-24H2)" : "Windows 10",
-        diagVer.build);
-
-    // Open dwm.exe and find dwmcore.dll
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, dwmPid);
-    if (!hProcess)
-    {
-        DiagLogPrintf(f, "ERROR: Could not open dwm.exe for reading (err=%lu)", GetLastError());
-        fclose(f);
-        return;
-    }
-
-    // Enumerate modules to find dwmcore.dll
-    HMODULE dwmcoreBase = NULL;
-    DWORD dwmcoreSize = 0;
-    {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, dwmPid);
-        if (snap != INVALID_HANDLE_VALUE)
-        {
-            MODULEENTRY32W me = {};
-            me.dwSize = sizeof(me);
-            if (Module32FirstW(snap, &me))
-            {
-                do {
-                    if (_wcsicmp(me.szModule, L"dwmcore.dll") == 0)
-                    {
-                        dwmcoreBase = me.hModule;
-                        dwmcoreSize = me.modBaseSize;
-                        break;
-                    }
-                } while (Module32NextW(snap, &me));
-            }
-            CloseHandle(snap);
-        }
-    }
-
-    if (!dwmcoreBase || dwmcoreSize == 0)
-    {
-        DiagLogPrintf(f, "ERROR: dwmcore.dll not found in dwm.exe");
-        CloseHandle(hProcess);
-        fclose(f);
-        return;
-    }
-
-    DiagLogPrintf(f, "dwmcore.dll base: 0x%llx  size: %lu bytes", (UINT64)dwmcoreBase, dwmcoreSize);
-
-    // Read the entire dwmcore.dll image from remote process
-    std::vector<unsigned char> image(dwmcoreSize);
-    SIZE_T bytesRead = 0;
-    if (!ReadProcessMemory(hProcess, dwmcoreBase, image.data(), dwmcoreSize, &bytesRead))
-    {
-        DiagLogPrintf(f, "ERROR: ReadProcessMemory failed (err=%lu, read %zu of %lu)",
-                      GetLastError(), bytesRead, dwmcoreSize);
-        // Try partial read — may have gaps due to guard pages
-        if (bytesRead == 0)
-        {
-            CloseHandle(hProcess);
-            fclose(f);
-            return;
-        }
-    }
-    DiagLogPrintf(f, "Read %zu bytes from dwmcore.dll", bytesRead);
-    CloseHandle(hProcess);
-
-    size_t imageSize = bytesRead;
-
-    // Select patterns for version
-    const unsigned char* presentPat;   int presentLen;
-    const unsigned char* directFlipPat; int directFlipLen;
-    const unsigned char* overlaysPat;  int overlaysLen;
-    const char* verLabel;
-
-    if (is25h2)
-    {
-        presentPat = pat_present_w11_25h2;     presentLen = sizeof(pat_present_w11_25h2);
-        directFlipPat = pat_directflip_w11_25h2; directFlipLen = sizeof(pat_directflip_w11_25h2);
-        overlaysPat = pat_overlays_w11_25h2;   overlaysLen = sizeof(pat_overlays_w11_25h2);
-        verLabel = "25H2";
-    }
-    else if (is24h2)
-    {
-        presentPat = pat_present_w11_24h2;     presentLen = sizeof(pat_present_w11_24h2);
-        directFlipPat = pat_directflip_w11_24h2; directFlipLen = sizeof(pat_directflip_w11_24h2);
-        overlaysPat = pat_overlays_w11_24h2;   overlaysLen = sizeof(pat_overlays_w11_24h2);
-        verLabel = "24H2";
-    }
-    else if (isWin11)
-    {
-        presentPat = pat_present_w11;          presentLen = sizeof(pat_present_w11);
-        directFlipPat = pat_directflip_w11;    directFlipLen = sizeof(pat_directflip_w11);
-        overlaysPat = pat_overlays_w11;        overlaysLen = sizeof(pat_overlays_w11);
-        verLabel = "Win11";
-    }
-    else
-    {
-        presentPat = pat_present_w10;          presentLen = sizeof(pat_present_w10);
-        directFlipPat = pat_directflip_w10;    directFlipLen = sizeof(pat_directflip_w10);
-        overlaysPat = pat_overlays_w10;        overlaysLen = sizeof(pat_overlays_w10);
-        verLabel = "Win10";
-    }
-
-    DiagLogPrintf(f, "Scanning with %s patterns...", verLabel);
-    DiagLogBytes(f, "Present pattern: ", presentPat, presentLen);
-    DiagLogBytes(f, "DirectFlip pattern: ", directFlipPat, directFlipLen);
-    DiagLogBytes(f, "OverlaysEnabled pattern: ", overlaysPat, overlaysLen);
-
-    // Scan for patterns
-    bool foundPresent = false, foundDirectFlip = false, foundOverlays = false;
-    size_t presentOff = 0, directFlipOff = 0, overlaysOff = 0;
-
-    for (size_t i = 0; i < imageSize; i++)
-    {
-        if (!foundPresent && i + presentLen <= imageSize &&
-            !aob_match_inverse(image.data() + i, presentPat, presentLen))
-        {
-            foundPresent = true;
-            presentOff = i;
-            DiagLogPrintf(f, "FOUND Present at offset 0x%zx", i);
-            DiagLogBytes(f, "Bytes: ", image.data() + i, 48);
-        }
-        else if (!foundDirectFlip && i + directFlipLen <= imageSize &&
-                 !aob_match_inverse(image.data() + i, directFlipPat, directFlipLen))
-        {
-            foundDirectFlip = true;
-            directFlipOff = i;
-            DiagLogPrintf(f, "FOUND DirectFlip at offset 0x%zx", i);
-            DiagLogBytes(f, "Bytes: ", image.data() + i, 48);
-        }
-        else if (!foundOverlays && i + overlaysLen <= imageSize &&
-                 !aob_match_inverse(image.data() + i, overlaysPat, overlaysLen))
-        {
-            foundOverlays = true;
-            overlaysOff = i;
-            DiagLogPrintf(f, "FOUND OverlaysEnabled at offset 0x%zx", i);
-            DiagLogBytes(f, "Bytes: ", image.data() + i, 48);
-        }
-
-        if (foundPresent && foundDirectFlip && foundOverlays)
-            break;
-    }
-
-    if (!foundPresent)   DiagLogPrintf(f, "NOT FOUND: Present pattern");
-    if (!foundDirectFlip) DiagLogPrintf(f, "NOT FOUND: DirectFlip pattern");
-    if (!foundOverlays)  DiagLogPrintf(f, "NOT FOUND: OverlaysEnabled pattern");
-
-    // If any pattern was not found, run discovery (broad prologue search)
-    if (!foundPresent || !foundDirectFlip || !foundOverlays)
-    {
-        DiagLogPrintf(f, "=== Pattern Discovery ===");
-
-        if (!foundPresent)
-        {
-            DiagLogPrintf(f, "--- Present candidates (prologue search) ---");
-            int count = 0;
-            // Type1: 40 53 55 56 57 41 56 41 57 48 81 EC
-            const unsigned char p1[] = { 0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC };
-            for (size_t i = 0; i < imageSize - 48 && count < 5; i++)
-            {
-                if (memcmp(image.data() + i, p1, sizeof(p1)) == 0)
-                {
-                    DiagLogPrintf(f, "  [Type1-BigStack] offset 0x%zx", i);
-                    DiagLogBytes(f, "", image.data() + i, 48);
-                    count++;
-                }
-            }
-            // Type2: 40 53 55 56 57 41 56 41 57 48 83 EC
-            const unsigned char p2[] = { 0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC };
-            for (size_t i = 0; i < imageSize - 48 && count < 10; i++)
-            {
-                if (memcmp(image.data() + i, p2, sizeof(p2)) == 0)
-                {
-                    DiagLogPrintf(f, "  [Type2-SmallStack] offset 0x%zx", i);
-                    DiagLogBytes(f, "", image.data() + i, 48);
-                    count++;
-                }
-            }
-            if (count == 0) DiagLogPrintf(f, "  No Present candidates found");
-        }
-
-        if (!foundDirectFlip)
-        {
-            DiagLogPrintf(f, "--- DirectFlip candidates (prologue search) ---");
-            int count = 0;
-            const unsigned char p[] = { 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC };
-            for (size_t i = 0; i < imageSize - 48 && count < 10; i++)
-            {
-                if (memcmp(image.data() + i, p, sizeof(p)) == 0)
-                {
-                    DiagLogPrintf(f, "  offset 0x%zx (stack_alloc=0x%02x)", i, image[i + sizeof(p)]);
-                    DiagLogBytes(f, "", image.data() + i, 48);
-                    count++;
-                }
-            }
-            if (count == 0) DiagLogPrintf(f, "  No DirectFlip candidates found");
-        }
-
-        if (!foundOverlays)
-        {
-            DiagLogPrintf(f, "--- OverlaysEnabled candidates ---");
-            int count = 0;
-            // Type1: cmp dword [rip+XX], imm  /  jz/jnz +4
-            for (size_t i = 0; i < imageSize - 16 && count < 10; i++)
-            {
-                if (image[i] == 0x83 && image[i + 1] == 0x3D &&
-                    (image[i + 7] == 0x74 || image[i + 7] == 0x75) &&
-                    image[i + 8] == 0x04)
-                {
-                    DiagLogPrintf(f, "  [cmp+jcc] offset 0x%zx", i);
-                    DiagLogBytes(f, "", image.data() + i, 16);
-                    count++;
-                }
-            }
-            // Type2: mov rax,[rcx+XX] / test rax,rax / jnz +4 / xor al,al / ret
-            for (size_t i = 0; i < imageSize - 16 && count < 15; i++)
-            {
-                if (image[i] == 0x48 && image[i + 1] == 0x8B && image[i + 2] == 0x41 &&
-                    image[i + 4] == 0x48 && image[i + 5] == 0x85 && image[i + 6] == 0xC0 &&
-                    image[i + 7] == 0x75 && image[i + 8] == 0x04 &&
-                    image[i + 9] == 0x32 && image[i + 10] == 0xC0 && image[i + 11] == 0xC3)
-                {
-                    DiagLogPrintf(f, "  [mov+test+jnz] offset 0x%zx", i);
-                    DiagLogBytes(f, "", image.data() + i, 16);
-                    count++;
-                }
-            }
-            if (count == 0) DiagLogPrintf(f, "  No OverlaysEnabled candidates found");
-        }
-    }
-
-    if (foundPresent && foundDirectFlip && foundOverlays)
-        DiagLogPrintf(f, "RESULT: All 3 patterns found — DLL should match. Injection failure is NOT a pattern issue.");
-    else
-        DiagLogPrintf(f, "RESULT: Pattern scan incomplete — DLL's DllMain would return FALSE.");
-
-    DiagLogPrintf(f, "=== End Remote Diagnostic Scan ===");
-    fclose(f);
-
-    wprintf(L"  Diagnostic scan written to: %s\n", logPath.c_str());
-}
 
 // ============================================================================
-// Forward declarations for functions used by probe mode
+// Probe mode — force PDB re-download and re-resolve symbols
 // ============================================================================
-static bool EnableDebugPrivilege();
-static bool ImpersonateSystem(bool verbose);
-static bool InjectDll(DWORD pid, const wchar_t* dllPath, const wchar_t* dllName, bool verbose);
-static bool IsModuleLoadedInProcess(DWORD pid, const wchar_t* dllName);
-static bool UninjectDll(DWORD pid, const wchar_t* dllName, bool verbose);
-
-// ============================================================================
-// Probe mode — cross-version pattern discovery and offset caching
-// ============================================================================
-
-struct ProbeCandidate {
-    size_t offset;
-    unsigned char bytes[64]; // first 64 bytes at this offset for scoring
-};
-
-// Reusable prologue discovery functions (refactored from RunRemoteDiagnostics)
-
-static std::vector<ProbeCandidate> FindPresentCandidates(
-    const unsigned char* image, size_t imageSize, int maxCandidates = 20)
-{
-    std::vector<ProbeCandidate> results;
-    // Type1: BigStack — 40 53 55 56 57 41 56 41 57 48 81 EC
-    const unsigned char p1[] = { 0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC };
-    for (size_t i = 0; i < imageSize - 64 && (int)results.size() < maxCandidates; i++)
-    {
-        if (memcmp(image + i, p1, sizeof(p1)) == 0)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            memcpy(c.bytes, image + i, 64);
-            results.push_back(c);
-        }
-    }
-    // Type2: SmallStack — 40 53 55 56 57 41 56 41 57 48 83 EC
-    const unsigned char p2[] = { 0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC };
-    for (size_t i = 0; i < imageSize - 64 && (int)results.size() < maxCandidates; i++)
-    {
-        if (memcmp(image + i, p2, sizeof(p2)) == 0)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            memcpy(c.bytes, image + i, 64);
-            results.push_back(c);
-        }
-    }
-    return results;
-}
-
-static std::vector<ProbeCandidate> FindDirectFlipCandidates(
-    const unsigned char* image, size_t imageSize, int maxCandidates = 20)
-{
-    std::vector<ProbeCandidate> results;
-    // 9-register save prologue: 40 55 53 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC
-    const unsigned char p[] = { 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC };
-    for (size_t i = 0; i < imageSize - 64 && (int)results.size() < maxCandidates; i++)
-    {
-        if (memcmp(image + i, p, sizeof(p)) == 0)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            memcpy(c.bytes, image + i, 64);
-            results.push_back(c);
-        }
-    }
-    // Also search for Win10-style DirectFlip: 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC
-    const unsigned char p10[] = { 0x48, 0x89, 0x7C, 0x24, 0x20, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC };
-    for (size_t i = 0; i < imageSize - 64 && (int)results.size() < maxCandidates; i++)
-    {
-        if (memcmp(image + i, p10, sizeof(p10)) == 0)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            memcpy(c.bytes, image + i, 64);
-            results.push_back(c);
-        }
-    }
-    return results;
-}
-
-static std::vector<ProbeCandidate> FindOverlaysEnabledCandidates(
-    const unsigned char* image, size_t imageSize, int maxCandidates = 20)
-{
-    std::vector<ProbeCandidate> results;
-    // Type1: cmp dword [rip+XX], imm / jz|jnz +4
-    for (size_t i = 0; i < imageSize - 16 && (int)results.size() < maxCandidates; i++)
-    {
-        if (image[i] == 0x83 && image[i + 1] == 0x3D &&
-            (image[i + 7] == 0x74 || image[i + 7] == 0x75) &&
-            image[i + 8] == 0x04)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            size_t copyLen = std::min((size_t)64, imageSize - i);
-            memcpy(c.bytes, image + i, copyLen);
-            results.push_back(c);
-        }
-    }
-    // Type2: mov rax,[rcx+XX] / test rax,rax / jnz +4 / xor al,al / ret
-    for (size_t i = 0; i < imageSize - 16 && (int)results.size() < maxCandidates; i++)
-    {
-        if (image[i] == 0x48 && image[i + 1] == 0x8B && image[i + 2] == 0x41 &&
-            image[i + 4] == 0x48 && image[i + 5] == 0x85 && image[i + 6] == 0xC0 &&
-            image[i + 7] == 0x75 && image[i + 8] == 0x04 &&
-            image[i + 9] == 0x32 && image[i + 10] == 0xC0 && image[i + 11] == 0xC3)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            size_t copyLen = std::min((size_t)64, imageSize - i);
-            memcpy(c.bytes, image + i, copyLen);
-            results.push_back(c);
-        }
-    }
-    // Type3: Win10-style — jnz +4 / xor al,al / ret / int3 / cmp [rcx+0x30], 1 / seta al / ret
-    for (size_t i = 0; i < imageSize - 16 && (int)results.size() < maxCandidates; i++)
-    {
-        if (image[i] == 0x75 && image[i + 1] == 0x04 &&
-            image[i + 2] == 0x32 && image[i + 3] == 0xC0 && image[i + 4] == 0xC3 &&
-            image[i + 5] == 0xCC && image[i + 6] == 0x83 && image[i + 7] == 0x79)
-        {
-            ProbeCandidate c;
-            c.offset = i;
-            size_t copyLen = std::min((size_t)64, imageSize - i);
-            memcpy(c.bytes, image + i, copyLen);
-            results.push_back(c);
-        }
-    }
-    return results;
-}
-
-// Compute similarity score: percentage of bytes that match (wildcards count as match)
-static double PatternSimilarityScore(const unsigned char* candidate,
-                                     const unsigned char* pattern, int patternLen)
-{
-    int matches = 0;
-    for (int i = 0; i < patternLen; i++)
-    {
-        if (pattern[i] == '?' || candidate[i] == pattern[i])
-            matches++;
-    }
-    return (double)matches / patternLen * 100.0;
-}
-
-// Read the dwmcore.dll image from a running dwm.exe process.
-// Returns the image bytes and sets dwmcoreSize. Caller provides dwmPid.
-static std::vector<unsigned char> ReadDwmcoreImage(DWORD dwmPid, DWORD* dwmcoreSize)
-{
-    *dwmcoreSize = 0;
-    std::vector<unsigned char> image;
-
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, dwmPid);
-    if (!hProcess) return image;
-
-    HMODULE dwmcoreBase = NULL;
-    {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, dwmPid);
-        if (snap != INVALID_HANDLE_VALUE)
-        {
-            MODULEENTRY32W me = {};
-            me.dwSize = sizeof(me);
-            if (Module32FirstW(snap, &me))
-            {
-                do {
-                    if (_wcsicmp(me.szModule, L"dwmcore.dll") == 0)
-                    {
-                        dwmcoreBase = me.hModule;
-                        *dwmcoreSize = me.modBaseSize;
-                        break;
-                    }
-                } while (Module32NextW(snap, &me));
-            }
-            CloseHandle(snap);
-        }
-    }
-
-    if (!dwmcoreBase || *dwmcoreSize == 0)
-    {
-        CloseHandle(hProcess);
-        return image;
-    }
-
-    image.resize(*dwmcoreSize);
-    SIZE_T bytesRead = 0;
-    ReadProcessMemory(hProcess, dwmcoreBase, image.data(), *dwmcoreSize, &bytesRead);
-    CloseHandle(hProcess);
-
-    if (bytesRead == 0)
-    {
-        image.clear();
-        return image;
-    }
-    image.resize(bytesRead);
-    return image;
-}
-
-// Phase A: Try ALL known pattern sets against dwmcore image.
-// Returns index into ALL_PATTERNS on success, or -1 on failure.
-static int CrossVersionPatternScan(const unsigned char* image, size_t imageSize,
-                                   INT64* outPresent, INT64* outDirectFlip, INT64* outOverlays,
-                                   bool verbose)
-{
-    for (int ps = 0; ps < NUM_PATTERN_SETS; ps++)
-    {
-        const PatternSet& p = ALL_PATTERNS[ps];
-        bool foundPresent = false, foundDirectFlip = false, foundOverlays = false;
-        INT64 presOff = 0, dfOff = 0, ovOff = 0;
-
-        for (size_t i = 0; i < imageSize; i++)
-        {
-            if (!foundPresent && i + p.presentLen <= imageSize &&
-                !aob_match_inverse(image + i, p.present, p.presentLen))
-            {
-                foundPresent = true;
-                presOff = (INT64)i;
-            }
-            else if (!foundDirectFlip && i + p.directFlipLen <= imageSize &&
-                     !aob_match_inverse(image + i, p.directFlip, p.directFlipLen))
-            {
-                foundDirectFlip = true;
-                dfOff = (INT64)i;
-            }
-            else if (!foundOverlays && i + p.overlaysLen <= imageSize &&
-                     !aob_match_inverse(image + i, p.overlays, p.overlaysLen))
-            {
-                foundOverlays = true;
-                ovOff = (INT64)i;
-            }
-            if (foundPresent && foundDirectFlip && foundOverlays)
-                break;
-        }
-
-        if (verbose)
-        {
-            wprintf(L"    [%S] Present=%s DirectFlip=%s Overlays=%s\n",
-                    p.label,
-                    foundPresent ? L"YES" : L"no",
-                    foundDirectFlip ? L"YES" : L"no",
-                    foundOverlays ? L"YES" : L"no");
-        }
-
-        if (foundPresent && foundDirectFlip && foundOverlays)
-        {
-            *outPresent = presOff;
-            *outDirectFlip = dfOff;
-            *outOverlays = ovOff;
-            return ps;
-        }
-    }
-    return -1;
-}
-
-// Scored combination for Phase C
-struct ScoredCombo {
-    size_t presentIdx, directFlipIdx, overlaysIdx;
-    int patternSetIdx; // which formal pattern set scored best
-    double totalScore; // sum of 3 similarity percentages
-};
 
 static void RunProbeMode(bool verbose)
 {
-    wprintf(L"\n=== Probe Mode: Offset Discovery ===\n\n");
+    wprintf(L"\n=== Probe Mode: Force PDB Re-query ===\n\n");
 
     // Detect version
     WindowsVersion wv = GetTrueWindowsVersion();
     const wchar_t* verName = L"Windows 10";
-    if (wv.build >= 22000) verName = L"Windows 11";
-    if (wv.build >= 26100) verName = L"Windows 11 24H2+";
+    bool isWin11 = (wv.build >= 22000);
+    bool is24h2 = (wv.build >= 26100);
+    if (isWin11) verName = L"Windows 11";
+    if (is24h2) verName = L"Windows 11 24H2+";
     if (wv.build >= 26200) verName = L"Windows 11 25H2+";
     wprintf(L"  Windows: %s (build %lu)\n", verName, wv.build);
 
@@ -2463,392 +2063,71 @@ static void RunProbeMode(bool verbose)
                 (verMS >> 16), (verMS & 0xFFFF), (verLS >> 16), (verLS & 0xFFFF), fileSz);
     }
 
-    // Enable privileges for reading dwm.exe
-    EnableDebugPrivilege();
-    ImpersonateSystem(false);
-
-    // Find dwm.exe
-    DWORD currentSession = 0;
-    ProcessIdToSessionId(GetCurrentProcessId(), &currentSession);
-    DWORD dwmPid = 0;
+    // Delete cached PDB to force re-download
+    wprintf(L"\n  Deleting cached PDB to force re-download...\n");
     {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap != INVALID_HANDLE_VALUE)
+        wchar_t localAppData[MAX_PATH];
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH))
         {
-            PROCESSENTRY32W pe = {};
-            pe.dwSize = sizeof(pe);
-            if (Process32FirstW(snap, &pe))
+            std::wstring cacheDir = std::wstring(localAppData) + L"\\Temp\\SymbolCache\\";
+            // Delete dwmcore.pdb files from cache
+            WIN32_FIND_DATAW fd;
+            std::wstring searchPath = cacheDir + L"dwmcore.pdb\\*";
+            HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE)
             {
                 do {
-                    if (_wcsicmp(pe.szExeFile, L"dwm.exe") == 0)
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
                     {
-                        DWORD sid = 0;
-                        ProcessIdToSessionId(pe.th32ProcessID, &sid);
-                        if (sid == currentSession) { dwmPid = pe.th32ProcessID; break; }
+                        std::wstring subDir = cacheDir + L"dwmcore.pdb\\" + fd.cFileName;
+                        std::wstring pdbFile = subDir + L"\\dwmcore.pdb";
+                        if (DeleteFileW(pdbFile.c_str()))
+                            wprintf(L"    Deleted: %s\n", pdbFile.c_str());
+                        RemoveDirectoryW(subDir.c_str());
                     }
-                } while (Process32NextW(snap, &pe));
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
             }
-            CloseHandle(snap);
         }
     }
 
-    if (dwmPid == 0)
+    // Re-resolve via PDB
+    wprintf(L"\n  Re-downloading and resolving PDB symbols...\n");
+    PdbResolvedOffsets pdb = ResolveDwmcorePdb(true);
+
+    if (!pdb.presentFound || !pdb.directFlipFound || !pdb.overlaysFound)
     {
-        wprintf(L"  ERROR: dwm.exe not found in session %lu.\n", currentSession);
-        RevertToSelf();
+        wprintf(L"\n  FAILED: PDB resolution incomplete.\n");
+        wprintf(L"    Present:    %s\n", pdb.presentFound ? L"found" : L"NOT FOUND");
+        wprintf(L"    DirectFlip: %s\n", pdb.directFlipFound ? L"found" : L"NOT FOUND");
+        wprintf(L"    Overlays:   %s\n", pdb.overlaysFound ? L"found" : L"NOT FOUND");
         return;
     }
-    wprintf(L"  dwm.exe PID: %lu\n\n", dwmPid);
 
-    // Read dwmcore.dll image
-    DWORD dwmcoreSize = 0;
-    auto image = ReadDwmcoreImage(dwmPid, &dwmcoreSize);
-    if (image.empty())
+    wprintf(L"\n  === PDB Results ===\n");
+    wprintf(L"  Present:         RVA 0x%llx\n", (UINT64)pdb.presentRva);
+    wprintf(L"  DirectFlip:      RVA 0x%llx\n", (UINT64)pdb.directFlipRva);
+    wprintf(L"  OverlaysEnabled: RVA 0x%llx\n", (UINT64)pdb.overlaysRva);
+
+    // Select runtime struct offsets for this OS version
+    INT32 hwProtOff, swapChainOff;
+    if (is24h2)
     {
-        wprintf(L"  ERROR: Could not read dwmcore.dll from dwm.exe.\n");
-        RevertToSelf();
-        return;
+        hwProtOff = OVERLAY_HWPROT_OFFSET_W11_24H2;
+        swapChainOff = OVERLAY_SWAPCHAIN_OFFSET_W11_24H2;
     }
-    wprintf(L"  Read %zu bytes from dwmcore.dll\n\n", image.size());
-
-    // ===== Phase A: Cross-version formal pattern scan =====
-    wprintf(L"  Phase A: Cross-version formal pattern scan...\n");
-    INT64 presOff = 0, dfOff = 0, ovOff = 0;
-    int matchedSet = CrossVersionPatternScan(image.data(), image.size(),
-                                             &presOff, &dfOff, &ovOff, verbose);
-
-    const char* method = nullptr;
-    int usedPatternSet = -1;
-
-    if (matchedSet >= 0)
+    else if (isWin11)
     {
-        method = "Cross-version AOB match";
-        usedPatternSet = matchedSet;
-        wprintf(L"\n  SUCCESS: Matched %S patterns!\n", ALL_PATTERNS[matchedSet].label);
-        wprintf(L"    Present:         offset 0x%llx\n", (UINT64)presOff);
-        wprintf(L"    DirectFlip:      offset 0x%llx\n", (UINT64)dfOff);
-        wprintf(L"    OverlaysEnabled: offset 0x%llx\n", (UINT64)ovOff);
+        hwProtOff = OVERLAY_HWPROT_OFFSET_W11;
+        swapChainOff = OVERLAY_SWAPCHAIN_OFFSET_W11;
     }
     else
     {
-        // ===== Phase B: Broad prologue discovery =====
-        wprintf(L"\n  Phase B: Broad prologue discovery...\n");
-        auto presentCands = FindPresentCandidates(image.data(), image.size());
-        auto dfCands = FindDirectFlipCandidates(image.data(), image.size());
-        auto ovCands = FindOverlaysEnabledCandidates(image.data(), image.size());
-
-        wprintf(L"    Present candidates:    %zu\n", presentCands.size());
-        wprintf(L"    DirectFlip candidates: %zu\n", dfCands.size());
-        wprintf(L"    Overlays candidates:   %zu\n", ovCands.size());
-
-        if (verbose)
-        {
-            for (size_t i = 0; i < presentCands.size(); i++)
-                wprintf(L"      Present[%zu]: 0x%zx\n", i, presentCands[i].offset);
-            for (size_t i = 0; i < dfCands.size(); i++)
-                wprintf(L"      DirectFlip[%zu]: 0x%zx\n", i, dfCands[i].offset);
-            for (size_t i = 0; i < ovCands.size(); i++)
-                wprintf(L"      Overlays[%zu]: 0x%zx\n", i, ovCands[i].offset);
-        }
-
-        if (presentCands.empty() || dfCands.empty() || ovCands.empty())
-        {
-            wprintf(L"\n  ERROR: Not enough candidates found for discovery.\n");
-            wprintf(L"  This dwmcore.dll may have a significantly different structure.\n");
-            RevertToSelf();
-            return;
-        }
-
-        // ===== Phase C: Score candidates against all formal patterns =====
-        wprintf(L"\n  Phase C: Scoring candidates against known patterns...\n");
-        std::vector<ScoredCombo> combos;
-
-        for (size_t pi = 0; pi < presentCands.size(); pi++)
-        {
-            for (size_t di = 0; di < dfCands.size(); di++)
-            {
-                for (size_t oi = 0; oi < ovCands.size(); oi++)
-                {
-                    // Score against each pattern set
-                    double bestScore = 0;
-                    int bestPS = 0;
-                    for (int ps = 0; ps < NUM_PATTERN_SETS; ps++)
-                    {
-                        const PatternSet& p = ALL_PATTERNS[ps];
-                        double s1 = PatternSimilarityScore(presentCands[pi].bytes, p.present, p.presentLen);
-                        double s2 = PatternSimilarityScore(dfCands[di].bytes, p.directFlip, p.directFlipLen);
-                        double s3 = PatternSimilarityScore(ovCands[oi].bytes, p.overlays, p.overlaysLen);
-                        double total = s1 + s2 + s3;
-                        if (total > bestScore)
-                        {
-                            bestScore = total;
-                            bestPS = ps;
-                        }
-                    }
-                    ScoredCombo sc;
-                    sc.presentIdx = pi;
-                    sc.directFlipIdx = di;
-                    sc.overlaysIdx = oi;
-                    sc.patternSetIdx = bestPS;
-                    sc.totalScore = bestScore;
-                    combos.push_back(sc);
-                }
-            }
-        }
-
-        // Sort by score descending
-        std::sort(combos.begin(), combos.end(),
-                  [](const ScoredCombo& a, const ScoredCombo& b) { return a.totalScore > b.totalScore; });
-
-        // Limit to top 10
-        if (combos.size() > 10) combos.resize(10);
-
-        wprintf(L"    Top combinations:\n");
-        for (size_t i = 0; i < combos.size(); i++)
-        {
-            const auto& c = combos[i];
-            wprintf(L"      #%zu: score=%.1f%% Present=0x%zx DirectFlip=0x%zx Overlays=0x%zx [%S]\n",
-                    i + 1, c.totalScore / 3.0,
-                    presentCands[c.presentIdx].offset,
-                    dfCands[c.directFlipIdx].offset,
-                    ovCands[c.overlaysIdx].offset,
-                    ALL_PATTERNS[c.patternSetIdx].label);
-        }
-
-        if (combos.empty() || combos[0].totalScore < 150.0) // < 50% average
-        {
-            wprintf(L"\n  WARNING: Best score is below 50%% — results may be unreliable.\n");
-        }
-
-        // ===== Phase D: Live testing =====
-        if (combos.size() > 1 && combos[0].totalScore - combos[1].totalScore < 10.0)
-        {
-            wprintf(L"\n  Phase D: Live testing (multiple high-scoring combinations)...\n");
-            wprintf(L"  Testing top combinations by injecting into DWM...\n\n");
-
-            std::wstring tempDir = GetSystemTempPath();
-            std::wstring cfgPath = tempDir + DITHER_CFG_FILE;
-            std::wstring dllDest = tempDir + DITHER_DLL_NAME;
-
-            // Get source DLL path
-            wchar_t exePath[MAX_PATH];
-            GetModuleFileNameW(NULL, exePath, MAX_PATH);
-            std::wstring exeDir(exePath);
-            exeDir = exeDir.substr(0, exeDir.find_last_of(L'\\') + 1);
-            std::wstring dllSource = exeDir + DITHER_DLL_NAME;
-
-            // Ensure DLL is deployed
-            CopyFileW(dllSource.c_str(), dllDest.c_str(), FALSE);
-
-            for (size_t ci = 0; ci < combos.size() && ci < 10; ci++)
-            {
-                const auto& c = combos[ci];
-                const PatternSet& ps = ALL_PATTERNS[c.patternSetIdx];
-                size_t pOff = presentCands[c.presentIdx].offset;
-                size_t dOff = dfCands[c.directFlipIdx].offset;
-                size_t oOff = ovCands[c.overlaysIdx].offset;
-
-                wprintf(L"  Testing combo #%zu (score=%.1f%%): P=0x%zx D=0x%zx O=0x%zx\n",
-                        ci + 1, c.totalScore / 3.0, pOff, dOff, oOff);
-
-                // Record DWM PID before injection
-                DWORD prePid = 0;
-                {
-                    HANDLE snap2 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                    if (snap2 != INVALID_HANDLE_VALUE)
-                    {
-                        PROCESSENTRY32W pe2 = {};
-                        pe2.dwSize = sizeof(pe2);
-                        if (Process32FirstW(snap2, &pe2))
-                        {
-                            do {
-                                if (_wcsicmp(pe2.szExeFile, L"dwm.exe") == 0)
-                                {
-                                    DWORD sid2 = 0;
-                                    ProcessIdToSessionId(pe2.th32ProcessID, &sid2);
-                                    if (sid2 == currentSession) { prePid = pe2.th32ProcessID; break; }
-                                }
-                            } while (Process32NextW(snap2, &pe2));
-                        }
-                        CloseHandle(snap2);
-                    }
-                }
-
-                // Write config
-                DitherConfig cfg = {};
-                cfg.magic = DITHER_CONFIG_MAGIC;
-                cfg.version = DITHER_CONFIG_VERSION;
-                cfg.presentOffset = (INT64)pOff;
-                cfg.directFlipOffset = (INT64)dOff;
-                cfg.overlaysOffset = (INT64)oOff;
-                cfg.hwProtOffset = ps.hwProtOffset;
-                cfg.swapChainOffset = ps.swapChainOffset;
-                cfg.isWindows11 = ps.isWin11 ? 1 : 0;
-                cfg.isWindows11_24h2 = (ps.hwProtOffset == OVERLAY_HWPROT_OFFSET_W11_24H2) ? 1 : 0;
-                cfg.ditherBits = 0;
-
-                HANDLE hCfg = CreateFileW(cfgPath.c_str(), GENERIC_WRITE, 0, NULL,
-                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hCfg != INVALID_HANDLE_VALUE)
-                {
-                    DWORD written;
-                    WriteFile(hCfg, &cfg, sizeof(cfg), &written, NULL);
-                    CloseHandle(hCfg);
-                }
-
-                // Inject
-                bool injected = InjectDll(prePid, dllDest.c_str(), DITHER_DLL_NAME, false);
-                if (!injected)
-                {
-                    wprintf(L"    Injection failed — skipping.\n");
-                    continue;
-                }
-
-                // Wait and check stability
-                Sleep(5000);
-
-                // Check if DWM survived (same PID still running)
-                DWORD postPid = 0;
-                {
-                    HANDLE snap3 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                    if (snap3 != INVALID_HANDLE_VALUE)
-                    {
-                        PROCESSENTRY32W pe3 = {};
-                        pe3.dwSize = sizeof(pe3);
-                        if (Process32FirstW(snap3, &pe3))
-                        {
-                            do {
-                                if (_wcsicmp(pe3.szExeFile, L"dwm.exe") == 0)
-                                {
-                                    DWORD sid3 = 0;
-                                    ProcessIdToSessionId(pe3.th32ProcessID, &sid3);
-                                    if (sid3 == currentSession) { postPid = pe3.th32ProcessID; break; }
-                                }
-                            } while (Process32NextW(snap3, &pe3));
-                        }
-                        CloseHandle(snap3);
-                    }
-                }
-
-                if (postPid != prePid)
-                {
-                    wprintf(L"    DWM crashed and restarted (PID %lu -> %lu) — bad combo.\n", prePid, postPid);
-                    // Update dwmPid for subsequent tests
-                    Sleep(3000); // Wait for DWM to stabilize
-                    continue;
-                }
-
-                // DWM survived — check if DLL is loaded
-                bool dllLoaded = IsModuleLoadedInProcess(postPid, DITHER_DLL_NAME);
-                if (!dllLoaded)
-                {
-                    wprintf(L"    DLL not loaded (DllMain returned FALSE) — pattern mismatch.\n");
-                    continue;
-                }
-
-                // Ask user
-                wprintf(L"    DWM stable, DLL loaded. Is display rendering normally? [Y/n] ");
-                fflush(stdout);
-                wchar_t response[16] = {};
-                if (fgetws(response, 16, stdin) && (response[0] == L'n' || response[0] == L'N'))
-                {
-                    wprintf(L"    User rejected — uninjecting and trying next.\n");
-                    UninjectDll(postPid, DITHER_DLL_NAME, false);
-                    Sleep(2000);
-                    continue;
-                }
-
-                // User accepted!
-                wprintf(L"    Accepted! Using this combination.\n");
-                UninjectDll(postPid, DITHER_DLL_NAME, false);
-                presOff = (INT64)pOff;
-                dfOff = (INT64)dOff;
-                ovOff = (INT64)oOff;
-                usedPatternSet = c.patternSetIdx;
-                method = "Live-tested probe";
-                goto probe_done;
-            }
-        }
-
-        // Use the top-scoring combo if we didn't do live testing or live testing failed
-        if (method == nullptr && !combos.empty())
-        {
-            const auto& best = combos[0];
-            presOff = (INT64)presentCands[best.presentIdx].offset;
-            dfOff = (INT64)dfCands[best.directFlipIdx].offset;
-            ovOff = (INT64)ovCands[best.overlaysIdx].offset;
-            usedPatternSet = best.patternSetIdx;
-            method = "Probe best-score";
-            wprintf(L"\n  Using top-scoring combination (%.1f%% confidence).\n",
-                    best.totalScore / 3.0);
-        }
+        hwProtOff = OVERLAY_HWPROT_OFFSET_W10;
+        swapChainOff = OVERLAY_SWAPCHAIN_OFFSET_W10;
     }
 
-probe_done:
-    if (method == nullptr)
-    {
-        wprintf(L"\n  FAILED: Could not determine offsets.\n");
-        RevertToSelf();
-        return;
-    }
-
-    // ===== Phase E: Save results =====
-    wprintf(L"\n  === Probe Results ===\n");
-    wprintf(L"  Windows: %s (build %lu)\n", verName, wv.build);
-    if (GetDwmcoreFileVersion(&verMS, &verLS, &fileSz))
-    {
-        wprintf(L"  dwmcore.dll: %u.%u.%u.%u  size: %u\n",
-                (verMS >> 16), (verMS & 0xFFFF), (verLS >> 16), (verLS & 0xFFFF), fileSz);
-    }
-    wprintf(L"\n  Method: %S", method);
-    if (usedPatternSet >= 0)
-        wprintf(L" (%S patterns)", ALL_PATTERNS[usedPatternSet].label);
-    wprintf(L"\n\n");
-
-    wprintf(L"  Present:         offset 0x%llx\n", (UINT64)presOff);
-    wprintf(L"  DirectFlip:      offset 0x%llx\n", (UINT64)dfOff);
-    wprintf(L"  OverlaysEnabled: offset 0x%llx\n\n", (UINT64)ovOff);
-
-    // Print bytes at discovered offsets
-    if (presOff < (INT64)image.size())
-    {
-        wprintf(L"  Present bytes:   ");
-        size_t n = std::min((size_t)28, image.size() - (size_t)presOff);
-        for (size_t i = 0; i < n; i++) wprintf(L"%02X ", image[(size_t)presOff + i]);
-        wprintf(L"\n");
-    }
-    if (dfOff < (INT64)image.size())
-    {
-        wprintf(L"  DirectFlip bytes:");
-        size_t n = std::min((size_t)21, image.size() - (size_t)dfOff);
-        for (size_t i = 0; i < n; i++) wprintf(L" %02X", image[(size_t)dfOff + i]);
-        wprintf(L"\n");
-    }
-    if (ovOff < (INT64)image.size())
-    {
-        wprintf(L"  Overlays bytes:  ");
-        size_t n = std::min((size_t)14, image.size() - (size_t)ovOff);
-        for (size_t i = 0; i < n; i++) wprintf(L"%02X ", image[(size_t)ovOff + i]);
-        wprintf(L"\n");
-    }
-
-    // Suggested C++ patterns
-    wprintf(L"\n  Suggested C++ patterns:\n");
-    auto printCPattern = [&](const wchar_t* name, INT64 off, int len) {
-        wprintf(L"    static const unsigned char %s[] = {\n        ", name);
-        size_t start = (size_t)off;
-        for (int i = 0; i < len && start + i < image.size(); i++)
-        {
-            if (i > 0 && i % 13 == 0) wprintf(L"\n        ");
-            wprintf(L"0x%02X, ", image[start + i]);
-        }
-        wprintf(L"\n    };\n");
-    };
-    printCPattern(L"pat_present_XXXXX", presOff, 28);
-    printCPattern(L"pat_directflip_XXXXX", dfOff, 21);
-    printCPattern(L"pat_overlays_XXXXX", ovOff, 14);
-
-    // Save to cache
+    // Save to offset cache
     OffsetCacheEntry cache = {};
     cache.magic = OFFSET_CACHE_MAGIC;
     cache.version = OFFSET_CACHE_VERSION;
@@ -2856,70 +2135,18 @@ probe_done:
     cache.dwmcoreVersionLS = verLS;
     cache.dwmcoreSizeBytes = fileSz;
     cache.osBuild = wv.build;
-    cache.presentOffset = presOff;
-    cache.directFlipOffset = dfOff;
-    cache.overlaysOffset = ovOff;
-    if (usedPatternSet >= 0)
-    {
-        cache.hwProtOffset = ALL_PATTERNS[usedPatternSet].hwProtOffset;
-        cache.swapChainOffset = ALL_PATTERNS[usedPatternSet].swapChainOffset;
-        cache.isWindows11 = ALL_PATTERNS[usedPatternSet].isWin11 ? 1 : 0;
-    }
-    else
-    {
-        // Fallback: use version-based defaults
-        cache.isWindows11 = (wv.build >= 22000) ? 1 : 0;
-        if (wv.build >= 26100) {
-            cache.hwProtOffset = OVERLAY_HWPROT_OFFSET_W11_24H2;
-            cache.swapChainOffset = OVERLAY_SWAPCHAIN_OFFSET_W11_24H2;
-        } else if (wv.build >= 22000) {
-            cache.hwProtOffset = OVERLAY_HWPROT_OFFSET_W11;
-            cache.swapChainOffset = OVERLAY_SWAPCHAIN_OFFSET_W11;
-        } else {
-            cache.hwProtOffset = OVERLAY_HWPROT_OFFSET_W10;
-            cache.swapChainOffset = OVERLAY_SWAPCHAIN_OFFSET_W10;
-        }
-    }
-    cache.sourceFlags = (matchedSet >= 0) ? 1 : 2; // 1=formal AOB, 2=probe
+    cache.presentOffset = pdb.presentRva;
+    cache.directFlipOffset = pdb.directFlipRva;
+    cache.overlaysOffset = pdb.overlaysRva;
+    cache.hwProtOffset = hwProtOff;
+    cache.swapChainOffset = swapChainOff;
+    cache.isWindows11 = isWin11 ? 1 : 0;
+    cache.sourceFlags = 1; // PDB
 
     if (SaveOffsetCache(&cache))
-        wprintf(L"\n  Saved to cache. Use --dither to apply immediately.\n");
+        wprintf(L"\n  Saved to cache. Use --dither to apply.\n");
     else
         wprintf(L"\n  WARNING: Could not save cache file.\n");
-
-    // Write human-readable report
-    std::wstring reportPath = GetSystemTempPath() + L"ApplyIccLut_probe_report.txt";
-    FILE* reportFile = NULL;
-    if (_wfopen_s(&reportFile, reportPath.c_str(), L"w") == 0 && reportFile)
-    {
-        fprintf(reportFile, "=== Probe Results ===\n");
-        fprintf(reportFile, "Windows: build %lu\n", wv.build);
-        fprintf(reportFile, "dwmcore.dll: %u.%u.%u.%u  size: %u\n",
-                (verMS >> 16), (verMS & 0xFFFF), (verLS >> 16), (verLS & 0xFFFF), fileSz);
-        fprintf(reportFile, "Method: %s", method);
-        if (usedPatternSet >= 0)
-            fprintf(reportFile, " (%s patterns)", ALL_PATTERNS[usedPatternSet].label);
-        fprintf(reportFile, "\n\n");
-        fprintf(reportFile, "Present:         offset 0x%llx\n", (UINT64)presOff);
-        fprintf(reportFile, "DirectFlip:      offset 0x%llx\n", (UINT64)dfOff);
-        fprintf(reportFile, "OverlaysEnabled: offset 0x%llx\n", (UINT64)ovOff);
-
-        fprintf(reportFile, "\nPresent bytes:   ");
-        size_t n = std::min((size_t)28, image.size() - (size_t)presOff);
-        for (size_t i = 0; i < n; i++) fprintf(reportFile, "%02X ", image[(size_t)presOff + i]);
-        fprintf(reportFile, "\nDirectFlip bytes:");
-        n = std::min((size_t)21, image.size() - (size_t)dfOff);
-        for (size_t i = 0; i < n; i++) fprintf(reportFile, " %02X", image[(size_t)dfOff + i]);
-        fprintf(reportFile, "\nOverlays bytes:  ");
-        n = std::min((size_t)14, image.size() - (size_t)ovOff);
-        for (size_t i = 0; i < n; i++) fprintf(reportFile, "%02X ", image[(size_t)ovOff + i]);
-        fprintf(reportFile, "\n");
-
-        fclose(reportFile);
-        wprintf(L"  Report written to: %s\n", reportPath.c_str());
-    }
-
-    RevertToSelf();
 }
 
 static DWORD FindProcessByName(const wchar_t* name)
@@ -3448,7 +2675,7 @@ static bool DeployAndInjectDither(bool verbose, int ditherBits = 0)
         if (LoadOffsetCache(&cached))
         {
             wprintf(L"  Using cached offsets (source: %s).\n",
-                    cached.sourceFlags == 1 ? L"formal AOB" : L"probe-discovered");
+                    cached.sourceFlags == 1 ? L"PDB-resolved" : L"cached");
             cfg.magic = DITHER_CONFIG_MAGIC;
             cfg.version = DITHER_CONFIG_VERSION;
             cfg.presentOffset = cached.presentOffset;
@@ -3470,11 +2697,8 @@ static bool DeployAndInjectDither(bool verbose, int ditherBits = 0)
         wprintf(L"  Scanning dwmcore.dll for hook targets (PID %lu)...\n", dwmPids[0]);
         if (!ScanDwmcorePatterns(dwmPids[0], diagIsWin11, diagIs24h2, diagIs25h2, ditherBits, &cfg))
         {
-            wprintf(L"  ERROR: Pattern scan failed — cannot inject dithering.\n");
-            wprintf(L"  TIP: Run 'ApplyIccLut.exe --probe' to discover offsets for this dwmcore.dll version.\n");
-            // Run extended diagnostics and write to log file
-            wprintf(L"  Running diagnostic discovery for new patterns...\n");
-            RunRemoteDiagnostics(dwmPids[0], diagIsWin11, diagIs24h2, diagIs25h2);
+            wprintf(L"  ERROR: PDB symbol resolution failed — cannot inject dithering.\n");
+            wprintf(L"  TIP: Run 'ApplyIccLut.exe --probe' to force re-download the PDB.\n");
             RevertToSelf();
             return false;
         }
@@ -3496,7 +2720,7 @@ static bool DeployAndInjectDither(bool verbose, int ditherBits = 0)
             newCache.hwProtOffset = cfg.hwProtOffset;
             newCache.swapChainOffset = cfg.swapChainOffset;
             newCache.isWindows11 = cfg.isWindows11;
-            newCache.sourceFlags = 1; // formal AOB
+            newCache.sourceFlags = 1; // PDB-resolved
             SaveOffsetCache(&newCache);
             if (verbose) wprintf(L"    Offsets saved to cache.\n");
         }
@@ -3784,9 +3008,9 @@ int wmain(int argc, wchar_t* argv[])
             wprintf(L"  --dither-bits <N>  Override dither bit depth (default: auto 8/10)\n");
             wprintf(L"              Use 8 for monitors with a bad 8-bit scaler on HDR\n");
             wprintf(L"  --no-dither Remove dithering DLL from DWM\n");
-            wprintf(L"  --probe     Discover dithering offsets for this dwmcore.dll version\n");
-            wprintf(L"              Tries all known patterns, then broad prologue search\n");
-            wprintf(L"              Results cached for use by --dither. Use -v for detail.\n");
+            wprintf(L"  --probe     Force re-download PDB and re-resolve dithering offsets\n");
+            wprintf(L"              Deletes cached PDB, re-downloads from Microsoft Symbol Server,\n");
+            wprintf(L"              and saves resolved offsets to cache for --dither.\n");
             wprintf(L"  -v          Verbose output\n");
             wprintf(L"  -h          Show this help\n\n");
             wprintf(L"Supported formats:\n");
