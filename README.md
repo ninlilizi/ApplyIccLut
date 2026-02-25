@@ -10,7 +10,7 @@ Windows 11 frequently fails to load the LUT (Look-Up Table) portion of ICC displ
 
 ## How It Works
 
-ApplyIccLut provides two methods for applying display calibration, plus an optional blue-noise dithering post-process:
+ApplyIccLut provides two methods for applying display calibration, plus hardware dithering:
 
 ### 1. SetDeviceGammaRamp (Legacy GDI Path)
 
@@ -24,17 +24,15 @@ Sets an installed ICC profile as the GPU default via `ColorProfileAddDisplayAsso
 
 This is the same mechanism used by Windows Color Management in Settings. The `-s` flag triggers a remove-then-add cycle that forces the driver to re-read and apply the profile, effectively "waking up" a pipeline that failed to activate at boot.
 
-### 3. Blue-Noise Dithering (DWM Injection)
+### 3. Hardware Dithering (NvAPI)
 
-Injects a lightweight DLL into the Desktop Window Manager (`dwm.exe`) that applies spatial blue-noise dithering as a GPU pixel shader post-process. This reduces visible banding artifacts in gradients caused by quantization when the output bit depth is limited:
+On NVIDIA GPUs, enables hardware spatial dithering at the display output stage via the undocumented `NvAPI_GPU_SetDitherControl` API. This operates **after** ICC/color management in the GPU pipeline, reducing visible banding artifacts in gradients caused by quantization to the display's native bit depth.
 
-- **SDR**: Dithers to 8-bit (255 levels) using gamma 2.2 perceptual threshold
-- **HDR**: Dithers to 10-bit (1023 levels) by default, PQ-aware (ST 2084) — quantizes in PQ space where the actual bit truncation occurs, with BT.709↔BT.2020 color space conversion for scRGB input
-- **Override**: Use `--dither-bits 8` to force 8-bit dithering on HDR, useful for monitors with a bad internal 8-bit scaler that truncates the 10-bit signal
+- **Supported bit depths**: 6-bit, 8-bit (default), 10-bit
+- **Dither mode**: Spatial dynamic (varies per frame to minimize visible patterns)
+- **Persistence**: The setting is applied directly to the GPU hardware and persists until reset. A flag file enables automatic re-application at boot via Task Scheduler.
 
-The dithering DLL hooks `COverlayContext::Present` in `dwmcore.dll` using MinHook and applies ordered dithering with a 64x64 blue-noise texture. The DLL stays resident in DWM after injection, so `ApplyIccLut.exe` does not need to remain running. DirectFlip and MPO (Multi-Plane Overlay) optimizations are disabled while dithering is active to ensure the shader runs on every frame.
-
-This feature is adapted from [dwm_lut](https://github.com/lauralex/dwm_lut) with all 3D LUT code removed.
+On non-NVIDIA systems, falls back to DWM injection (blue-noise shader post-process via `dwmcore.dll` hooking). The DWM fallback is adapted from [dwm_lut](https://github.com/lauralex/dwm_lut).
 
 ## Supported Formats
 
@@ -52,7 +50,7 @@ This feature is adapted from [dwm_lut](https://github.com/lauralex/dwm_lut) with
 ApplyIccLut.exe [options]
 ```
 
-With no arguments, performs a **GPU pipeline wake-up kick on all monitors** — re-applying both SDR and HDR default profiles via the full-precision ColorProfile API (equivalent to `-s -m 0`). If dithering was previously enabled with `--dither`, it is automatically re-injected.
+With no arguments, performs a **GPU pipeline wake-up kick on all monitors** — re-applying both SDR and HDR default profiles via the full-precision ColorProfile API (equivalent to `-s -m 0`). If dithering was previously enabled with `--dither`, it is automatically re-enabled.
 
 ### Options
 
@@ -66,9 +64,9 @@ With no arguments, performs a **GPU pipeline wake-up kick on all monitors** — 
 | `-R` | Restore: re-enable the GPU color profile as default. |
 | `--sdr` | Target SDR pipeline only (applies to `-s`, `-r`, `-R`). |
 | `--hdr` | Target HDR pipeline only (applies to `-s`, `-r`, `-R`). |
-| `-d` / `--dither` | Inject blue-noise dithering DLL into DWM. |
-| `--dither-bits <N>` | Override dither bit depth (default: auto 8 for SDR, 10 for HDR). Use 8 for HDR monitors with a bad 8-bit internal scaler. |
-| `--no-dither` | Remove dithering DLL from DWM. |
+| `-d` / `--dither` | Enable dithering (NvAPI hardware on NVIDIA, DWM injection fallback). |
+| `--dither-bits <N>` | Override dither bit depth. NvAPI supports 6, 8, 10 (default: 8). |
+| `--no-dither` | Disable dithering (resets NvAPI and removes DWM injection). |
 | `-v` | Verbose output (ramp samples, API details). |
 | `-h` | Show help. |
 
@@ -98,17 +96,20 @@ ApplyIccLut.exe -R --sdr
 # Force-apply even if a LUT is already loaded
 ApplyIccLut.exe -f
 
-# Enable blue-noise dithering (injected into DWM)
+# Enable hardware dithering (NvAPI on NVIDIA, DWM fallback)
 ApplyIccLut.exe --dither
 
 # Disable dithering
 ApplyIccLut.exe --no-dither
 
-# Enable dithering alongside GPU pipeline wake-up
+# Enable dithering with verbose output (shows per-display status)
 ApplyIccLut.exe --dither -v
 
-# Enable dithering forced to 8-bit (for HDR monitors with bad 8-bit scaler)
-ApplyIccLut.exe --dither --dither-bits 8
+# Enable 6-bit dithering (for 6-bit+FRC panels)
+ApplyIccLut.exe --dither --dither-bits 6
+
+# Enable 10-bit dithering (for 10-bit HDR panels)
+ApplyIccLut.exe --dither --dither-bits 10
 ```
 
 ## Administrator Privileges
@@ -150,9 +151,9 @@ If profiles are not persisting across reboots, you can create a Task Scheduler t
 MSBuild.exe ApplyIccLut.sln -p:Configuration=Release -p:Platform=x64
 ```
 
-Output: `x64\Release\ApplyIccLut.exe` and `x64\Release\ApplyIccLut_Dither.dll`
+Output: `x64\Release\ApplyIccLut.exe` (and `x64\Release\ApplyIccLut_Dither.dll` for the DWM fallback)
 
-Place both files in the same directory. The DLL is deployed to `%SYSTEMROOT%\Temp\` at injection time.
+For NvAPI dithering (NVIDIA), only `ApplyIccLut.exe` is needed. For the DWM injection fallback, place both files in the same directory.
 
 ### Dependencies
 
@@ -169,10 +170,9 @@ The GPU ColorProfile APIs (`ColorProfileAddDisplayAssociation`, `ColorProfileRem
 - The `-s` wake-up kick works by removing and re-adding the profile as the default, which forces the GPU driver to re-read and apply it.
 - The pre-flight ramp check compares the current gamma ramp against both identity and the target LUT to avoid double-application.
 - `.cube` is primarily a 3D LUT format (IRIDAS/Adobe), but also carries optional 1D LUT data. This tool reads only the 1D portion (`LUT_1D_SIZE`); 3D-only files are rejected since `SetDeviceGammaRamp` can only apply per-channel 1D curves.
-- **Blue-noise dithering** uses a 64x64 pre-computed blue-noise texture (from [momentsingraphics.de](http://momentsingraphics.de/BlueNoise.html)) to distribute quantization error. SDR dithering uses gamma 2.2 perceptual thresholding. HDR dithering is PQ-aware (SMPTE ST 2084): it converts scRGB to BT.2020 linear, encodes to PQ, quantizes in PQ space (where the display interface truncates), and converts back — thresholds are compared in linear light for perceptual uniformity. The `--dither-bits` flag overrides the auto bit depth, stored in a config file (`%SYSTEMROOT%\Temp\ApplyIccLut_dither.cfg`) that the DLL reads at injection time.
-- **DWM hooking** uses AOB (Array of Bytes) pattern scanning to locate `COverlayContext::Present`, `IsCandidateDirectFlipCompatible`, and `OverlaysEnabled` in `dwmcore.dll`. These patterns may change with Windows updates.
-- The dithering DLL disables DirectFlip and MPO when active, which adds a small amount of GPU overhead for DWM composition. This is necessary to ensure the dithering shader runs on every frame.
-- Boot persistence for dithering uses a flag file (`%SYSTEMROOT%\Temp\ApplyIccLut_dither.flag`). When the tool runs with no arguments (default GPU wake-up mode) and this flag exists, the dithering DLL is automatically re-injected.
+- **NvAPI hardware dithering** uses the undocumented `NvAPI_GPU_SetDitherControl` (function ID `0xDF0DFCDD`) resolved via `nvapi_QueryInterface`. It applies spatial dynamic dithering at the display output stage, after all GPU color management. Supported bit depths are 6, 8, and 10. The API is the same one used by [novideo_srgb](https://github.com/ledoge/novideo_srgb).
+- **DWM injection fallback** (non-NVIDIA) uses blue-noise dithering via a 64x64 texture injected as a pixel shader post-process in `dwmcore.dll`. DWM hooking uses PDB symbol resolution to locate `COverlayContext::Present`, `IsCandidateDirectFlipCompatible`, and `OverlaysEnabled`. These offsets may change with Windows updates.
+- Boot persistence for dithering uses a flag file (`%SYSTEMROOT%\Temp\ApplyIccLut_dither.flag`). When the tool runs with no arguments (default GPU wake-up mode) and this flag exists, dithering is automatically re-enabled. The flag stores the method (`nvapi:` prefix for NvAPI) and bit depth.
 
 ## License
 
