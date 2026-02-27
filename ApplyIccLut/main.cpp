@@ -2553,8 +2553,10 @@ typedef NvAPI_Status (*NvAPI_GetPhysicalGPUsFromDisplay_t)(NvDisplayHandle displ
 typedef NvAPI_Status (*NvAPI_GetAssociatedDisplayOutputId_t)(NvDisplayHandle display, NvU32* outputId);
 // SetDitherControl takes individual params: (gpu, outputId, state, bits, mode)
 typedef NvAPI_Status (*NvAPI_GPU_SetDitherControl_t)(NvPhysicalGpuHandle gpu, NvU32 outputId, NvU32 state, NvU32 bits, NvU32 mode);
-// GetDitherControl takes a struct pointer
-typedef NvAPI_Status (*NvAPI_GPU_GetDitherControl_t)(NvPhysicalGpuHandle gpu, NvU32 outputId, NV_GPU_DITHER_CONTROL_V1* pControl);
+// GetDitherControl takes a displayId (NOT gpu+outputId): (displayId, struct*)
+typedef NvAPI_Status (*NvAPI_GPU_GetDitherControl_t)(NvU32 displayId, NV_GPU_DITHER_CONTROL_V1* pControl);
+// Convert gpu handle + outputId → displayId
+typedef NvAPI_Status (*NvAPI_SYS_GetDisplayIdFromGpuAndOutputId_t)(NvPhysicalGpuHandle gpu, NvU32 outputId, NvU32* displayId);
 typedef NvAPI_Status (*NvAPI_GetErrorMessage_t)(NvAPI_Status nr, char szDesc[64]);
 
 // NvAPI function IDs (resolved via nvapi_QueryInterface)
@@ -2566,6 +2568,7 @@ static constexpr NvU32 NVFUNC_GET_GPUS_FROM_DISPLAY       = 0x34EF9506;
 static constexpr NvU32 NVFUNC_GET_ASSOC_DISPLAY_OUTPUT_ID = 0xD995937E;
 static constexpr NvU32 NVFUNC_SET_DITHER_CONTROL          = 0xDF0DFCDD;
 static constexpr NvU32 NVFUNC_GET_DITHER_CONTROL          = 0x932AC8FB;
+static constexpr NvU32 NVFUNC_DISPLAYID_FROM_GPU_OUTPUT   = 0x08F2BAB4;
 static constexpr NvU32 NVFUNC_GET_ERROR_MESSAGE           = 0x6C2D048C;
 
 struct NvApiContext {
@@ -2578,6 +2581,7 @@ struct NvApiContext {
     NvAPI_GetAssociatedDisplayOutputId_t GetAssocOutputId;
     NvAPI_GPU_SetDitherControl_t SetDitherControl;
     NvAPI_GPU_GetDitherControl_t GetDitherControl;
+    NvAPI_SYS_GetDisplayIdFromGpuAndOutputId_t GetDisplayIdFromGpuAndOutputId;
     NvAPI_GetErrorMessage_t GetErrorMessage;
 };
 
@@ -2609,6 +2613,7 @@ static bool LoadNvApi(NvApiContext& ctx, bool verbose)
     ctx.GetAssocOutputId  = (NvAPI_GetAssociatedDisplayOutputId_t)qi(NVFUNC_GET_ASSOC_DISPLAY_OUTPUT_ID);
     ctx.SetDitherControl  = (NvAPI_GPU_SetDitherControl_t)qi(NVFUNC_SET_DITHER_CONTROL);
     ctx.GetDitherControl  = (NvAPI_GPU_GetDitherControl_t)qi(NVFUNC_GET_DITHER_CONTROL);
+    ctx.GetDisplayIdFromGpuAndOutputId = (NvAPI_SYS_GetDisplayIdFromGpuAndOutputId_t)qi(NVFUNC_DISPLAYID_FROM_GPU_OUTPUT);
     ctx.GetErrorMessage   = (NvAPI_GetErrorMessage_t)qi(NVFUNC_GET_ERROR_MESSAGE);
 
     if (!ctx.Initialize || !ctx.EnumDisplayHandle || !ctx.GetGPUsFromDisplay ||
@@ -2644,8 +2649,44 @@ static const char* NvApiErrorStr(NvApiContext& ctx, NvAPI_Status st)
     return buf;
 }
 
+// SEH-isolated helpers: NvAPI function pointers resolved via QueryInterface may be
+// invalid on some driver versions. These wrappers prevent a crash from killing the
+// process. Isolated in their own functions because SEH and C++ destructors cannot
+// coexist in the same function.
+static bool SafeGetDitherControl(NvAPI_GPU_GetDitherControl_t fn,
+                                 NvU32 displayId,
+                                 NV_GPU_DITHER_CONTROL_V1* pOut, NvAPI_Status* pStatus)
+{
+    __try
+    {
+        *pStatus = fn(displayId, pOut);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool SafeSetDitherControl(NvAPI_GPU_SetDitherControl_t fn,
+                                 NvPhysicalGpuHandle gpu, NvU32 outputId,
+                                 NvU32 state, NvU32 bits, NvU32 mode,
+                                 NvAPI_Status* pStatus)
+{
+    __try
+    {
+        *pStatus = fn(gpu, outputId, state, bits, mode);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 // ditherMode: 0=SpatialDynamic, 1=SpatialStatic, 2=SpatialDynamic2x2, 3=SpatialStatic2x2, 4=Temporal
-static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose)
+// targetDisplay: 0 = all displays, 1-based = specific display index
+static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose, int targetDisplay = 0)
 {
     NvApiContext nv;
     if (!LoadNvApi(nv, verbose))
@@ -2666,19 +2707,26 @@ static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose)
         L"spatial-static-2x2", L"temporal"
     };
     NvU32 nvMode = (ditherMode >= 0 && ditherMode <= 4) ? (NvU32)ditherMode : 4;
-    wprintf(L"  NvAPI: enabling %s %s dithering on all displays...\n", bitsName, modeNames[nvMode]);
+
+    bool canGet = nv.GetDitherControl && nv.GetDisplayIdFromGpuAndOutputId;
+    if (!canGet)
+        wprintf(L"  NvAPI: WARNING: GetDitherControl not available, cannot check current state.\n");
 
     int displayCount = 0;
     int successCount = 0;
+    int skippedCount = 0;
 
     for (NvU32 i = 0; i < 64; i++)
     {
         NvDisplayHandle display = nullptr;
         NvAPI_Status st = nv.EnumDisplayHandle(i, &display);
         if (st != NVAPI_OK)
-            break; // no more displays
+            break;
 
         displayCount++;
+
+        if (targetDisplay > 0 && static_cast<int>(i + 1) != targetDisplay)
+            continue;
 
         // Get GPU handle for this display
         NvPhysicalGpuHandle gpus[NVAPI_MAX_PHYSICAL_GPUS] = {};
@@ -2690,7 +2738,6 @@ static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose)
             continue;
         }
 
-        // Get output ID for this display
         NvU32 outputId = 0;
         st = nv.GetAssocOutputId(display, &outputId);
         if (st != NVAPI_OK)
@@ -2699,29 +2746,65 @@ static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose)
             continue;
         }
 
-        // Log current dither state (verbose only)
-        if (verbose && nv.GetDitherControl)
+        // Check current state via GetDitherControl (SEH-protected)
+        if (canGet)
         {
-            NV_GPU_DITHER_CONTROL_V1 cur = {};
-            cur.version = NV_GPU_DITHER_CONTROL_VER1;
-            st = nv.GetDitherControl(gpus[0], outputId, &cur);
-            if (st == NVAPI_OK)
+            NvU32 displayId = 0;
+            st = nv.GetDisplayIdFromGpuAndOutputId(gpus[0], outputId, &displayId);
+            if (st != NVAPI_OK)
             {
-                wprintf(L"    Display %u: current state=%u bits=%u mode=%u bitsCaps=0x%X modeCaps=0x%X\n",
-                    i, cur.state, cur.bits, cur.mode, cur.bitsCaps, cur.modeCaps);
+                wprintf(L"    Display %u: WARNING: GetDisplayIdFromGpuAndOutputId failed (%hs)\n", i, NvApiErrorStr(nv, st));
+            }
+            else
+            {
+                NV_GPU_DITHER_CONTROL_V1 cur = {};
+                cur.version = NV_GPU_DITHER_CONTROL_VER1;
+                NvAPI_Status getSt = 0;
+                if (!SafeGetDitherControl(nv.GetDitherControl, displayId, &cur, &getSt))
+                {
+                    wprintf(L"    Display %u: WARNING: GetDitherControl crashed (SEH caught). "
+                            L"Falling through to Set.\n", i);
+                    canGet = false; // don't try again on other displays
+                }
+                else if (getSt != NVAPI_OK)
+                {
+                    wprintf(L"    Display %u: WARNING: GetDitherControl returned error %d (%hs)\n",
+                            i, getSt, NvApiErrorStr(nv, getSt));
+                }
+                else
+                {
+                    if (verbose)
+                        wprintf(L"    Display %u: current state=%u bits=%u mode=%u\n",
+                                i, cur.state, cur.bits, cur.mode);
+
+                    if (cur.state == 1 && cur.bits == nvBits && cur.mode == nvMode)
+                    {
+                        successCount++;
+                        skippedCount++;
+                        if (verbose) wprintf(L"    Display %u: already correct, skipping\n", i);
+                        continue;
+                    }
+                }
             }
         }
 
-        // Set dither: state=Enabled(1), bits=target, mode=user-selected
-        st = nv.SetDitherControl(gpus[0], outputId, 1, nvBits, nvMode);
-        if (st == NVAPI_OK)
+        // Set dither: state=Enabled(1), bits=target, mode=user-selected (SEH-protected)
+        NvAPI_Status setSt = 0;
+        if (!SafeSetDitherControl(nv.SetDitherControl, gpus[0], outputId, 1, nvBits, nvMode, &setSt))
+        {
+            wprintf(L"    Display %u: FATAL: SetDitherControl crashed (SEH caught). "
+                    L"NvAPI function pointer may be invalid.\n", i);
+            continue;
+        }
+
+        if (setSt == NVAPI_OK)
         {
             successCount++;
             if (verbose) wprintf(L"    Display %u (outputId=0x%X): dithering enabled\n", i, outputId);
         }
         else
         {
-            wprintf(L"    Display %u: SetDitherControl failed (%hs)\n", i, NvApiErrorStr(nv, st));
+            wprintf(L"    Display %u: SetDitherControl failed (%hs)\n", i, NvApiErrorStr(nv, setSt));
         }
     }
 
@@ -2733,11 +2816,16 @@ static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose)
         return false;
     }
 
-    wprintf(L"  NvAPI: dithering enabled on %d of %d display(s).\n", successCount, displayCount);
+    if (skippedCount > 0 && skippedCount == successCount)
+        wprintf(L"  NvAPI: dithering already correct on %d display(s), no changes made.\n", skippedCount);
+    else if (skippedCount > 0)
+        wprintf(L"  NvAPI: dithering set on %d display(s) (%d already correct).\n", successCount, skippedCount);
+    else
+        wprintf(L"  NvAPI: dithering enabled on %d of %d display(s).\n", successCount, displayCount);
     return successCount > 0;
 }
 
-static bool DisableNvApiDithering(bool verbose)
+static bool DisableNvApiDithering(bool verbose, int targetDisplay = 0)
 {
     NvApiContext nv;
     if (!LoadNvApi(nv, verbose))
@@ -2757,6 +2845,9 @@ static bool DisableNvApiDithering(bool verbose)
 
         displayCount++;
 
+        if (targetDisplay > 0 && static_cast<int>(i + 1) != targetDisplay)
+            continue;
+
         NvPhysicalGpuHandle gpus[NVAPI_MAX_PHYSICAL_GPUS] = {};
         NvU32 gpuCount = 0;
         st = nv.GetGPUsFromDisplay(display, gpus, &gpuCount);
@@ -2767,15 +2858,20 @@ static bool DisableNvApiDithering(bool verbose)
         if (st != NVAPI_OK) continue;
 
         // Reset to Default state (0), bits and mode ignored when state=Default
-        st = nv.SetDitherControl(gpus[0], outputId, 0, 0, 0);
-        if (st == NVAPI_OK)
+        NvAPI_Status setSt = 0;
+        if (!SafeSetDitherControl(nv.SetDitherControl, gpus[0], outputId, 0, 0, 0, &setSt))
+        {
+            wprintf(L"    Display %u: FATAL: SetDitherControl crashed (SEH caught).\n", i);
+            continue;
+        }
+        if (setSt == NVAPI_OK)
         {
             successCount++;
             if (verbose) wprintf(L"    Display %u (outputId=0x%X): dither reset to default\n", i, outputId);
         }
         else
         {
-            if (verbose) wprintf(L"    Display %u: SetDitherControl(Default) failed (%hs)\n", i, NvApiErrorStr(nv, st));
+            if (verbose) wprintf(L"    Display %u: SetDitherControl(Default) failed (%hs)\n", i, NvApiErrorStr(nv, setSt));
         }
     }
 
@@ -3301,6 +3397,7 @@ int wmain(int argc, wchar_t* argv[])
             wprintf(L"  --hdr       Target HDR pipeline only (for -s, -r, -R)\n");
             wprintf(L"              Default: both SDR and HDR when neither is specified\n");
             wprintf(L"  -d          Enable dithering (NvAPI hardware on NVIDIA, DWM fallback)\n");
+            wprintf(L"              Use with -m <num> to target a single display (default: all)\n");
             wprintf(L"  --dither-bits <N>  Override dither bit depth (NvAPI: 6/8/10, default: 8)\n");
             wprintf(L"  --dither-mode <M>  NvAPI dither mode (default: temporal)\n");
             wprintf(L"              Modes: temporal, spatial, spatial-static,\n");
@@ -3352,16 +3449,16 @@ int wmain(int argc, wchar_t* argv[])
     {
         // Try NvAPI hardware dithering first (NVIDIA GPUs)
         wprintf(L"Dithering: attempting NvAPI hardware dithering...\n");
-        if (EnableNvApiDithering(ditherBits, ditherModeVal, verbose))
+        if (EnableNvApiDithering(ditherBits, ditherModeVal, verbose, targetMonitor))
         {
             // Write flag file for boot persistence with "nvapi:" prefix
-            // Format: "nvapi:<bits>,<mode>"
+            // Format: "nvapi:<bits>,<mode>,<monitor>"
             std::wstring flagPath = GetSystemTempPath() + DITHER_FLAG_FILE;
             HANDLE hFlag = CreateFileW(flagPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFlag != INVALID_HANDLE_VALUE)
             {
                 char buf[32];
-                int len = wsprintfA(buf, "nvapi:%d,%d", ditherBits, ditherModeVal);
+                int len = wsprintfA(buf, "nvapi:%d,%d,%d", ditherBits, ditherModeVal, targetMonitor);
                 DWORD written;
                 WriteFile(hFlag, buf, len, &written, NULL);
                 CloseHandle(hFlag);
@@ -3382,7 +3479,7 @@ int wmain(int argc, wchar_t* argv[])
     {
         // Disable NvAPI hardware dithering (safe even if not NVIDIA)
         wprintf(L"Dithering: disabling...\n");
-        DisableNvApiDithering(verbose);
+        DisableNvApiDithering(verbose, targetMonitor);
 
         // Also remove DWM-injected dithering and flag files
         UninjectAndRemoveDither(verbose);
@@ -3404,9 +3501,10 @@ int wmain(int argc, wchar_t* argv[])
         if (IsDitherFlagSet())
         {
             // Read stored dither settings from flag file
-            // Format: "nvapi:<bits>,<mode>" or just "<bits>" for DWM
+            // Format: "nvapi:<bits>,<mode>,<monitor>" or just "<bits>" for DWM
             int storedBits = 0;
             int storedMode = 4; // default: Temporal
+            int storedMonitor = 0; // 0 = all
             bool storedNvApi = false;
             {
                 std::wstring flagPath = GetSystemTempPath() + DITHER_FLAG_FILE;
@@ -3428,7 +3526,7 @@ int wmain(int argc, wchar_t* argv[])
                             val = val * 10 + (buf[j] - '0');
                         if (val > 0 && val <= 16)
                             storedBits = val;
-                        // Parse mode after comma
+                        // Parse mode after first comma
                         if (j < bytesRead && buf[j] == ',')
                         {
                             j++;
@@ -3437,6 +3535,15 @@ int wmain(int argc, wchar_t* argv[])
                                 mval = mval * 10 + (buf[j] - '0');
                             if (mval >= 0 && mval <= 4)
                                 storedMode = mval;
+                        }
+                        // Parse monitor after second comma
+                        if (j < bytesRead && buf[j] == ',')
+                        {
+                            j++;
+                            int monval = 0;
+                            for (; j < bytesRead && buf[j] >= '0' && buf[j] <= '9'; j++)
+                                monval = monval * 10 + (buf[j] - '0');
+                            storedMonitor = monval;
                         }
                     }
                     else
@@ -3453,7 +3560,7 @@ int wmain(int argc, wchar_t* argv[])
             if (storedNvApi)
             {
                 wprintf(L"Dithering: re-enabling NvAPI hardware dithering (flag file present)...\n");
-                EnableNvApiDithering(storedBits, storedMode, verbose);
+                EnableNvApiDithering(storedBits, storedMode, verbose, storedMonitor);
                 wprintf(L"\n");
             }
             else if (!IsDitherAlreadyInjected())
