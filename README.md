@@ -68,6 +68,7 @@ With no arguments, performs a **GPU pipeline wake-up kick on all monitors** — 
 | `--dither-bits <N>` | Override dither bit depth. NvAPI supports 6, 8, 10 (default: 8). |
 | `--dither-mode <M>` | NvAPI dither mode: `temporal` (default), `spatial`, `spatial-static`, `spatial2x2`, `spatial-static-2x2`. |
 | `--no-dither` | Disable dithering (resets NvAPI and removes DWM injection). |
+| `-q` / `--silent` | Silent mode: no console window, no output. Ideal for scheduled tasks. |
 | `-v` | Verbose output (ramp samples, API details). |
 | `-h` | Show help. |
 
@@ -136,9 +137,10 @@ If profiles are not persisting across reboots, you can create a Task Scheduler t
    - Ensure **"Run only when user is logged on"** is selected (the tool needs the user's display session).
 3. **Trigger** tab: Add a trigger for **"At log on"** (for your user account).
    - Optionally add a delay (e.g. 10 seconds) to allow the display driver to initialize.
+   - For dithering persistence, you can also add a **repeating trigger** (e.g. every 5 minutes) to re-apply dithering after sleep/wake or monitor changes. The tool checks the current hardware state and only applies changes when needed, so redundant runs are harmless.
 4. **Action** tab: Add **"Start a program"**.
    - **Program**: Full path to `ApplyIccLut.exe`
-   - **Arguments**: No arguments needed (defaults to all monitors). Or use `-m 1` to target a specific monitor, `--hdr` for HDR only, etc.
+   - **Arguments**: Use `-q` for silent operation (no console window). For example: `-q -d -m 1` to silently ensure dithering on monitor 1, or just `-q` for a silent wake-up kick on all monitors.
 
 ## Building
 

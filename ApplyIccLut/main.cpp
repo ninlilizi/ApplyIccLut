@@ -35,6 +35,10 @@
 #include <vector>
 #include <algorithm>
 
+// Windows subsystem: no console window is created on launch.
+// In non-silent mode we attach to the parent console (or allocate one).
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup")
+
 #pragma comment(lib, "mscms.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -3267,6 +3271,28 @@ static bool IsDitherAlreadyInjected()
 
 int wmain(int argc, wchar_t* argv[])
 {
+    // Pre-scan for --silent / -q. As a SUBSYSTEM:WINDOWS app, no console exists
+    // on startup. In normal mode we attach to the parent console (cmd.exe) or
+    // allocate a new one so output is visible. In silent mode we skip this
+    // entirely — no window ever appears.
+    bool silent = false;
+    for (int i = 1; i < argc; i++)
+    {
+        if (wcscmp(argv[i], L"-q") == 0 || wcscmp(argv[i], L"--silent") == 0)
+        {
+            silent = true;
+            break;
+        }
+    }
+    if (!silent)
+    {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS))
+            AllocConsole();
+        FILE* dummy;
+        freopen_s(&dummy, "CONOUT$", "w", stdout);
+        freopen_s(&dummy, "CONOUT$", "w", stderr);
+    }
+
     wprintf(L"ApplyIccLut - ICC/Cube LUT Loader for Windows 11\n");
     wprintf(L"=================================================\n\n");
 
@@ -3403,6 +3429,7 @@ int wmain(int argc, wchar_t* argv[])
             wprintf(L"              Modes: temporal, spatial, spatial-static,\n");
             wprintf(L"                     spatial2x2, spatial-static-2x2\n");
             wprintf(L"  --no-dither Disable dithering (resets NvAPI + removes DWM injection)\n");
+            wprintf(L"  -q          Silent mode: no console window, no output (for scheduled tasks)\n");
             wprintf(L"  -v          Verbose output\n");
             wprintf(L"  -h          Show this help\n\n");
             wprintf(L"Supported formats:\n");
