@@ -505,6 +505,8 @@ struct MonitorInfo
     std::wstring eddDeviceId;     // DeviceID from EnumDisplayDevices
     LUID         adapterId;       // GPU adapter LUID (for ColorProfile APIs)
     UINT32       sourceId;        // Display source ID (for ColorProfile APIs)
+    LUID         targetAdapterId; // Target adapter LUID (for advanced colour params)
+    UINT32       targetId;        // Display target ID (for advanced colour params)
 };
 
 static std::vector<MonitorInfo> EnumerateMonitors()
@@ -553,9 +555,12 @@ static std::vector<MonitorInfo> EnumerateMonitors()
         if (DisplayConfigGetDeviceInfo(&sourceName.header) == ERROR_SUCCESS)
             info.gdiDeviceName = sourceName.viewGdiDeviceName;
 
-        // Store adapter/source IDs for ColorProfile APIs
-        info.adapterId = path.sourceInfo.adapterId;
-        info.sourceId  = path.sourceInfo.id;
+        // Store adapter/source IDs for ColorProfile APIs, and the target IDs
+        // for the advanced-colour-params (MaxFALL) DisplayConfig calls.
+        info.adapterId       = path.sourceInfo.adapterId;
+        info.sourceId        = path.sourceInfo.id;
+        info.targetAdapterId = path.targetInfo.adapterId;
+        info.targetId        = path.targetInfo.id;
 
         if (info.gdiDeviceName.empty())
             continue;
@@ -579,6 +584,163 @@ static std::vector<MonitorInfo> EnumerateMonitors()
     }
 
     return monitors;
+}
+
+// ============================================================================
+// HDR MaxFALL override via DisplayConfig advanced colour params
+//
+// Windows applies the ICC/MHC2 LUT when a profile is activated but never updates
+// the HDR static metadata it reports — in particular MaxFALL (Max Frame-Average
+// Light Level). That metadata lives in an undocumented "advanced colour params"
+// block reachable through DisplayConfig (the same path ColorControl uses):
+//   - GET  via type 0xFFFFFFFE on the SOURCE: returns a large blob containing a
+//          ColorParams struct (primaries, white point, luminances).
+//   - SET  via type 0xFFFFFFF0 on the TARGET: writes the ColorParams back.
+// Luminance fields are in units of 0.0001 nit (nits * 10000); primary/white-point
+// fields are EDID-style fixed point. We read the current params and rewrite only
+// MaxFullFrameLuminance, preserving everything else.
+// ============================================================================
+
+static constexpr UINT32 DCINFO_GET_DISPLAY_INFO    = 0xFFFFFFFE;
+static constexpr UINT32 DCINFO_SET_ADV_COLOR_PARAM = 0xFFFFFFF0;
+
+#pragma pack(push, 1)
+struct CcdColorParams
+{
+    UINT32 redPointX, redPointY;          // EDID-style fixed point
+    UINT32 greenPointX, greenPointY;
+    UINT32 bluePointX, bluePointY;
+    UINT32 whitePointX, whitePointY;
+    UINT32 minLuminance;                  // nits * 10000
+    UINT32 maxLuminance;                  // nits * 10000
+    UINT32 maxFullFrameLuminance;         // MaxFALL, nits * 10000
+};
+
+// GET blob (type 0xFFFFFFFE): ColorParams sits inside a larger opaque structure.
+struct CcdGetDisplayInfo
+{
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    BYTE           stuff1[1964];
+    CcdColorParams colorParams;
+    BYTE           stuff2[28];
+};
+
+// SET packet (type 0xFFFFFFF0): header + ColorParams + 4 trailing bytes.
+struct CcdSetAdvColorParam
+{
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    CcdColorParams colorParams;
+    BYTE           stuff[4];
+};
+#pragma pack(pop)
+
+// Read the advanced colour params for a given adapter/id via DisplayConfig (the
+// undocumented GET type 0xFFFFFFFE). Returns false on failure.
+static bool CcdGetColorParams(LUID adapterId, UINT32 id, CcdColorParams& out)
+{
+    CcdGetDisplayInfo getInfo = {};
+    getInfo.header.type      = (DISPLAYCONFIG_DEVICE_INFO_TYPE)DCINFO_GET_DISPLAY_INFO;
+    getInfo.header.size      = sizeof(getInfo);
+    getInfo.header.adapterId = adapterId;
+    getInfo.header.id        = id;
+
+    if (DisplayConfigGetDeviceInfo(&getInfo.header) != ERROR_SUCCESS)
+        return false;
+
+    out = getInfo.colorParams;
+    return true;
+}
+
+// Write the HDR luminance block (MaxFALL + max luminance) once, for a single
+// display. Mirrors ColorControl's SetMinMaxLuminance: read the current params,
+// keep the colour primaries, then rewrite the white point (forced to D65 at the
+// detected fixed-point precision), MinLuminance (0), MaxLuminance and
+// MaxFullFrameLuminance, and write the whole block back. Rewriting the full block
+// (rather than only MaxFALL) is what makes the driver actually apply it.
+// On success, *pReadbackFall receives the MaxFALL the source GET reports afterward.
+static bool WriteCcdHdrMetadataOnce(const MonitorInfo& mon, int maxFallNits, int maxLumNits,
+                                    UINT32* pReadbackFall)
+{
+    CcdColorParams params = {};
+    if (!CcdGetColorParams(mon.adapterId, mon.sourceId, params))
+        return false;
+
+    // Newer Win11 stores primary/white-point fixed-point at 2^20 precision; older
+    // builds use 2^10. Detect from the (preserved) red primary, as the reference does.
+    UINT32 divider = (params.redPointX <= (1u << 10)) ? (1u << 10) : (1u << 20);
+
+    params.minLuminance          = 0;
+    params.maxLuminance          = static_cast<UINT32>(maxLumNits)  * 10000u;
+    params.maxFullFrameLuminance = static_cast<UINT32>(maxFallNits) * 10000u;
+    params.whitePointX           = static_cast<UINT32>(0.31269932 * divider);
+    params.whitePointY           = static_cast<UINT32>(0.32899952 * divider);
+
+    CcdSetAdvColorParam setParam = {};
+    setParam.header.type      = (DISPLAYCONFIG_DEVICE_INFO_TYPE)DCINFO_SET_ADV_COLOR_PARAM;
+    setParam.header.size      = sizeof(setParam);
+    setParam.header.adapterId = mon.targetAdapterId; // SET targets the target
+    setParam.header.id        = mon.targetId;
+    setParam.colorParams      = params;
+
+    if (DisplayConfigSetDeviceInfo(&setParam.header) != ERROR_SUCCESS)
+        return false;
+
+    if (pReadbackFall)
+    {
+        CcdColorParams rb = {};
+        *pReadbackFall = CcdGetColorParams(mon.adapterId, mon.sourceId, rb)
+                       ? rb.maxFullFrameLuminance : 0;
+    }
+    return true;
+}
+
+// Set (and, if requested, enforce) the HDR MaxFALL for a single display. The GPU
+// profile wake-up kick triggers an asynchronous calibration reload that resets the
+// HDR metadata shortly after it runs — landing *after* a single write and reverting
+// it. When enforceMs > 0 we re-assert the value across that window so our write is
+// the last one to land. enforceMs = 0 does a single write (e.g. no wake-up ran).
+static bool ApplyCcdHdrMetadata(const MonitorInfo& mon, int maxFallNits, int maxLumNits,
+                                int enforceMs, bool verbose)
+{
+    CcdColorParams cur = {};
+    if (CcdGetColorParams(mon.adapterId, mon.sourceId, cur))
+        wprintf(L"  MaxFALL: current MaxFALL=%.0f, MaxLum=%.0f nits\n",
+                cur.maxFullFrameLuminance / 10000.0, cur.maxLuminance / 10000.0);
+
+    const int    interval = 500;
+    bool everSet  = false;
+    int  elapsed  = 0;
+
+    for (;;)
+    {
+        UINT32 readback = 0;
+        if (WriteCcdHdrMetadataOnce(mon, maxFallNits, maxLumNits, &readback))
+        {
+            everSet = true;
+            if (verbose)
+                wprintf(L"  MaxFALL: wrote %d nits (readback %.0f) [t=%dms]\n",
+                        maxFallNits, readback / 10000.0, elapsed);
+        }
+        else if (verbose)
+        {
+            wprintf(L"  MaxFALL: write failed [t=%dms]\n", elapsed);
+        }
+
+        if (elapsed >= enforceMs)
+            break;
+
+        Sleep(interval);
+        elapsed += interval;
+    }
+
+    if (!everSet)
+    {
+        wprintf(L"  MaxFALL: failed to set advanced colour params.\n");
+        return false;
+    }
+
+    wprintf(L"  MaxFALL: set to %d nits (MaxLum %d nits).\n", maxFallNits, maxLumNits);
+    return true;
 }
 
 // ============================================================================
@@ -1528,6 +1690,62 @@ static std::wstring GetSystemTempPath()
     wchar_t sysRoot[MAX_PATH];
     GetEnvironmentVariableW(L"SYSTEMROOT", sysRoot, MAX_PATH);
     return std::wstring(sysRoot) + L"\\Temp\\";
+}
+
+static const wchar_t* BOOT_FLAG_FILE = L"ApplyIccLut_boot.flag";
+
+// System boot time as a FILETIME (100 ns units), computed from uptime. Stable
+// within a boot session: GetTickCount64 includes time spent asleep, so this does
+// not drift across sleep/resume; a reboot resets uptime and shifts it forward.
+static ULONGLONG GetBootTime100ns()
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULONGLONG now = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    ULONGLONG uptime = (ULONGLONG)GetTickCount64() * 10000ULL;
+    return (now > uptime) ? (now - uptime) : 0;
+}
+
+// True if this is the first invocation since the machine booted, determined by
+// comparing the current boot time against a stored stamp. When it is the first
+// run and recordIfFirst is set, the current boot time is written so subsequent
+// runs in the same session return false. A generous tolerance absorbs minor clock
+// jitter; reboots always shift the boot time by far more than the tolerance.
+static bool IsFirstRunSinceBoot(bool recordIfFirst)
+{
+    std::wstring path = GetSystemTempPath() + BOOT_FLAG_FILE;
+    ULONGLONG boot = GetBootTime100ns();
+
+    ULONGLONG stored = 0;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        char buf[32] = {};
+        DWORD n = 0;
+        if (ReadFile(h, buf, sizeof(buf) - 1, &n, NULL))
+            stored = _strtoui64(buf, nullptr, 10);
+        CloseHandle(h);
+    }
+
+    const ULONGLONG tolerance = 60ULL * 10000000ULL; // 60 s in 100 ns units
+    ULONGLONG diff = (boot > stored) ? (boot - stored) : (stored - boot);
+    bool sameBoot = (stored != 0) && (diff < tolerance);
+
+    if (!sameBoot && recordIfFirst)
+    {
+        HANDLE hw = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hw != INVALID_HANDLE_VALUE)
+        {
+            char buf[32];
+            int len = wsprintfA(buf, "%llu", boot);
+            DWORD w = 0;
+            WriteFile(hw, buf, (DWORD)len, &w, NULL);
+            CloseHandle(hw);
+        }
+    }
+    return !sameBoot;
 }
 
 // ============================================================================
@@ -3313,12 +3531,20 @@ int wmain(int argc, wchar_t* argv[])
     bool targetHdr   = false;
     bool monitorExplicit = false; // true if -m was given on the command line
     int  targetMonitor = 1; // 1-based index, 0 = all monitors
+    int  maxFall     = -1;   // -1 = not requested; otherwise MaxFALL in nits
+    int  maxLum      = 1300; // accompanying max luminance (nits) for the metadata write
+    bool wakeOnce    = false; // gate the profile wake-up to the first run per boot
 
     for (int i = 1; i < argc; i++)
     {
         if (wcscmp(argv[i], L"-v") == 0 || wcscmp(argv[i], L"--verbose") == 0)
         {
             verbose = true;
+        }
+        else if (wcscmp(argv[i], L"-q") == 0 || wcscmp(argv[i], L"--silent") == 0)
+        {
+            // Already handled by the pre-scan; recognise it here so it isn't
+            // rejected as an unknown option (which would abort before any work).
         }
         else if (wcscmp(argv[i], L"-r") == 0 || wcscmp(argv[i], L"--reset") == 0)
         {
@@ -3382,6 +3608,28 @@ int wmain(int argc, wchar_t* argv[])
                 return 1;
             }
         }
+        else if (wcscmp(argv[i], L"--maxfall") == 0 && i + 1 < argc)
+        {
+            maxFall = _wtoi(argv[++i]);
+            if (maxFall < 1 || maxFall > 65535)
+            {
+                wprintf(L"Invalid MaxFALL: %s  (valid range: 1-65535 nits)\n", argv[i]);
+                return 1;
+            }
+        }
+        else if (wcscmp(argv[i], L"--maxlum") == 0 && i + 1 < argc)
+        {
+            maxLum = _wtoi(argv[++i]);
+            if (maxLum < 1 || maxLum > 65535)
+            {
+                wprintf(L"Invalid MaxLum: %s  (valid range: 1-65535 nits)\n", argv[i]);
+                return 1;
+            }
+        }
+        else if (wcscmp(argv[i], L"--wake-once") == 0)
+        {
+            wakeOnce = true;
+        }
         else if ((wcscmp(argv[i], L"-p") == 0 || wcscmp(argv[i], L"--profile") == 0)
                  && i + 1 < argc)
         {
@@ -3429,6 +3677,13 @@ int wmain(int argc, wchar_t* argv[])
             wprintf(L"              Modes: temporal, spatial, spatial-static,\n");
             wprintf(L"                     spatial2x2, spatial-static-2x2\n");
             wprintf(L"  --no-dither Disable dithering (resets NvAPI + removes DWM injection)\n");
+            wprintf(L"  --maxfall <nits>   Set HDR MaxFALL via DisplayConfig (HDR must be on)\n");
+            wprintf(L"              Rewrites the HDR luminance metadata; runs alongside\n");
+            wprintf(L"              profile activation. Range: 1-65535 nits.\n");
+            wprintf(L"  --maxlum <nits>    Max luminance written with --maxfall (default: 1300)\n");
+            wprintf(L"  --wake-once Only run the profile wake-up on the first run since boot\n");
+            wprintf(L"              (dither/--maxfall still apply every run). Ideal for a\n");
+            wprintf(L"              task that runs every few minutes.\n");
             wprintf(L"  -q          Silent mode: no console window, no output (for scheduled tasks)\n");
             wprintf(L"  -v          Verbose output\n");
             wprintf(L"  -h          Show this help\n\n");
@@ -3513,14 +3768,27 @@ int wmain(int argc, wchar_t* argv[])
         wprintf(L"\n");
     }
 
-    // If only dither/no-dither was requested, exit early
-    if ((ditherMode || noDitherMode) && !setGpuMode && !resetMode && !restoreMode && manualProfile.empty())
+    // If only dither/no-dither was requested, exit early. --wake-once and --maxfall
+    // both have work to do beyond dithering, so they keep us going.
+    if ((ditherMode || noDitherMode) && !setGpuMode && !resetMode && !restoreMode
+        && manualProfile.empty() && maxFall < 0 && !wakeOnce)
         return 0;
 
-    // Default behaviour: no mode selected → GPU pipeline wake-up on all monitors
+    // Default behaviour: no mode selected → GPU pipeline wake-up on all monitors.
+    // With --wake-once, only wake on the first run since boot (so a recurring task
+    // can apply dither/MaxFALL every run but rouse the profile just once per boot).
     if (!setGpuMode && !resetMode && !restoreMode && manualProfile.empty())
     {
-        setGpuMode = true;  // bare -s behaviour (wake-up kick)
+        bool doWake = true;
+        if (wakeOnce)
+        {
+            doWake = IsFirstRunSinceBoot(true);
+            wprintf(doWake
+                        ? L"Profile wake-up: first run since boot — applying.\n"
+                        : L"Profile wake-up: skipped (already done this boot).\n");
+        }
+        if (doWake)
+            setGpuMode = true;  // bare -s behaviour (wake-up kick)
         if (!monitorExplicit)
             targetMonitor = 0; // all monitors
 
@@ -3646,22 +3914,52 @@ int wmain(int argc, wchar_t* argv[])
         wprintf(L"GPU ColorProfile APIs: %s\n\n",
                 gpuApi.loaded ? L"available" : L"not available");
 
-    // Process selected monitor(s)
+    // Process selected monitor(s). With --wake-once on a non-first run there is no
+    // profile work to do — skip straight to MaxFALL/dither without touching the
+    // colour pipeline (and without its costly calibration reload).
     int okCount   = 0;
     int failCount = 0;
+    bool anyMonitorWork = setGpuMode || resetMode || restoreMode || !manualProfile.empty();
 
-    for (size_t i = 0; i < monitors.size(); i++)
+    if (anyMonitorWork)
     {
-        // Skip monitors that aren't selected (0 = all)
-        if (targetMonitor > 0 && static_cast<int>(i + 1) != targetMonitor)
-            continue;
+        for (size_t i = 0; i < monitors.size(); i++)
+        {
+            // Skip monitors that aren't selected (0 = all)
+            if (targetMonitor > 0 && static_cast<int>(i + 1) != targetMonitor)
+                continue;
 
-        if (ProcessMonitor(monitors[i], manualProfile, resetMode, restoreMode,
-                           setGpuMode, setGpuProfile, hdrModes,
-                           forceApply, verbose, gpuApi))
-            okCount++;
-        else
-            failCount++;
+            if (ProcessMonitor(monitors[i], manualProfile, resetMode, restoreMode,
+                               setGpuMode, setGpuProfile, hdrModes,
+                               forceApply, verbose, gpuApi))
+                okCount++;
+            else
+                failCount++;
+        }
+    }
+
+    // Apply MaxFALL override last, after the colour pipeline is active. Windows
+    // sets the ICC/MHC2 LUT when the profile activates but leaves the HDR static
+    // metadata untouched; this drives the separate DisplayConfig call that sets it.
+    // The wake-up kick (setGpuMode) fires an async calibration reload that resets
+    // the HDR metadata shortly after; settle past the bulk of it, then enforce the
+    // value across a window so our write lands last.
+    if (maxFall >= 0)
+    {
+        int enforceMs = setGpuMode ? 6000 : 0;
+        if (enforceMs > 0)
+            Sleep(1500); // let the bulk of the calibration reload settle first
+
+        wprintf(L"\nMaxFALL: setting to %d nits...\n", maxFall);
+        for (size_t i = 0; i < monitors.size(); i++)
+        {
+            if (targetMonitor > 0 && static_cast<int>(i + 1) != targetMonitor)
+                continue;
+
+            wprintf(L"  Monitor %zu (%s):\n", i + 1,
+                    monitors[i].friendlyName.empty() ? L"unknown" : monitors[i].friendlyName.c_str());
+            ApplyCcdHdrMetadata(monitors[i], maxFall, maxLum, enforceMs, verbose);
+        }
     }
 
     wprintf(L"Done. %d succeeded, %d failed.\n", okCount, failCount);

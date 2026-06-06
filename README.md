@@ -68,6 +68,9 @@ With no arguments, performs a **GPU pipeline wake-up kick on all monitors** — 
 | `--dither-bits <N>` | Override dither bit depth. NvAPI supports 6, 8, 10 (default: 8). |
 | `--dither-mode <M>` | NvAPI dither mode: `temporal` (default), `spatial`, `spatial-static`, `spatial2x2`, `spatial-static-2x2`. |
 | `--no-dither` | Disable dithering (resets NvAPI and removes DWM injection). |
+| `--maxfall <nits>` | Set the HDR MaxFALL (Max Frame-Average Light Level) via DisplayConfig. HDR must be active. Range 1–65535 nits. |
+| `--maxlum <nits>` | Max luminance written alongside `--maxfall` (default: 1300). |
+| `--wake-once` | Run the profile wake-up kick only on the first invocation since boot; dithering and `--maxfall` still apply on every run. Ideal for a task that runs every few minutes. |
 | `-q` / `--silent` | Silent mode: no console window, no output. Ideal for scheduled tasks. |
 | `-v` | Verbose output (ramp samples, API details). |
 | `-h` | Show help. |
@@ -115,6 +118,9 @@ ApplyIccLut.exe --dither --dither-bits 10
 
 # Enable spatial dynamic dithering instead of temporal
 ApplyIccLut.exe --dither --dither-mode spatial
+
+# Wake up the GPU pipelines AND set HDR MaxFALL to 265 nits on monitor 1
+ApplyIccLut.exe -m 1 --maxfall 265
 ```
 
 ## Administrator Privileges
@@ -141,6 +147,16 @@ If profiles are not persisting across reboots, you can create a Task Scheduler t
 4. **Action** tab: Add **"Start a program"**.
    - **Program**: Full path to `ApplyIccLut.exe`
    - **Arguments**: Use `-q` for silent operation (no console window). For example: `-q -d -m 1` to silently ensure dithering on monitor 1, or just `-q` for a silent wake-up kick on all monitors.
+
+### One task, every few minutes (dither + MaxFALL always, wake once per boot)
+
+A single repeating task can keep dithering and MaxFALL applied while only waking the colour profile once per boot. Use a trigger **"At log on"** with **"Repeat task every: 5 minutes"**, and arguments such as:
+
+```
+-q -d --maxfall 265 -m 1 --wake-once
+```
+
+On the first run after each boot, `--wake-once` performs the full profile wake-up (and MaxFALL is enforced across the calibration reload). On every subsequent run it skips the wake-up entirely — just re-asserting dithering and writing MaxFALL — so the recurring task stays cheap and never disrupts the display. The "first run since boot" is tracked by a flag in `%SYSTEMROOT%\Temp` keyed to the system boot time, so it resets automatically on reboot (and is unaffected by sleep/resume).
 
 ## Building
 
@@ -178,6 +194,8 @@ The GPU ColorProfile APIs (`ColorProfileAddDisplayAssociation`, `ColorProfileRem
 - `.cube` is primarily a 3D LUT format (IRIDAS/Adobe), but also carries optional 1D LUT data. This tool reads only the 1D portion (`LUT_1D_SIZE`); 3D-only files are rejected since `SetDeviceGammaRamp` can only apply per-channel 1D curves.
 - **NvAPI hardware dithering** uses the undocumented `NvAPI_GPU_SetDitherControl` (function ID `0xDF0DFCDD`) resolved via `nvapi_QueryInterface`. It applies dithering at the display output stage, after all GPU color management. Supported bit depths are 6, 8, and 10. Modes: temporal (default), spatial-dynamic, spatial-static, spatial-dynamic-2x2, spatial-static-2x2. The API is the same one used by [novideo_srgb](https://github.com/ledoge/novideo_srgb).
 - **DWM injection fallback** (non-NVIDIA) uses blue-noise dithering via a 64x64 texture injected as a pixel shader post-process in `dwmcore.dll`. DWM hooking uses PDB symbol resolution to locate `COverlayContext::Present`, `IsCandidateDirectFlipCompatible`, and `OverlaysEnabled`. These offsets may change with Windows updates.
+- **MaxFALL override** (`--maxfall`) uses the undocumented DisplayConfig "advanced colour params" device-info types (`DisplayConfigGetDeviceInfo` type `0xFFFFFFFE` on the source to read, `DisplayConfigSetDeviceInfo` type `0xFFFFFFF0` on the target to write). Windows applies the ICC/MHC2 LUT when a profile is activated but never updates the HDR static metadata it reports; this is the separate Windows API call that does. The tool reads the current `ColorParams`, preserves the colour primaries, then rewrites the white point (forced to D65 at the detected fixed-point precision), `MinLuminance` (0), `MaxLuminance` (`--maxlum`, default 1300), and `MaxFullFrameLuminance` (`--maxfall`), all in units of nits × 10000, and writes the whole block back. Rewriting the full block — rather than only MaxFALL — is what makes the driver actually apply it. This is the same mechanism ColorControl uses, and is vendor-agnostic. HDR must be active for the value to take effect.
+- **MaxFALL enforce window**: the GPU pipeline wake-up triggers an *asynchronous* Windows calibration reload (the Calibration Loader task + `SetDisplayConfig` refresh) that resets the HDR metadata a few seconds later — landing after a single write and reverting it. So when a wake-up has run, the tool settles ~1.5 s and then re-asserts MaxFALL every 500 ms across a ~6 s window, ensuring its write is the last to land. With `-v`, each write/readback is timestamped. When no wake-up runs (the value is set in isolation), a single write suffices.
 - Boot persistence for dithering uses a flag file (`%SYSTEMROOT%\Temp\ApplyIccLut_dither.flag`). When the tool runs with no arguments (default GPU wake-up mode) and this flag exists, dithering is automatically re-enabled. The flag stores the method (`nvapi:` prefix for NvAPI) and bit depth.
 
 ## License
