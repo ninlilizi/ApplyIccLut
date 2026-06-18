@@ -586,6 +586,16 @@ static std::vector<MonitorInfo> EnumerateMonitors()
     return monitors;
 }
 
+// Resolve a 1-based -m selection to its GDI device name (e.g. "\\.\DISPLAY1").
+// Returns empty for "all monitors" (0) or an out-of-range index, in which case
+// callers treat it as no name-based restriction.
+static std::wstring GdiNameForTarget(const std::vector<MonitorInfo>& monitors, int targetMonitor)
+{
+    if (targetMonitor <= 0 || targetMonitor > static_cast<int>(monitors.size()))
+        return L"";
+    return monitors[targetMonitor - 1].gdiDeviceName;
+}
+
 // ============================================================================
 // HDR MaxFALL override via DisplayConfig advanced colour params
 //
@@ -1113,7 +1123,8 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
                            bool resetMode, bool restoreMode,
                            bool setGpuMode, const std::wstring& setGpuProfile,
                            const std::vector<bool>& hdrModes,
-                           bool forceApply, bool verbose, const GpuColorProfileApi& gpuApi)
+                           bool forceApply, bool singleMonitor, bool verbose,
+                           const GpuColorProfileApi& gpuApi)
 {
     wprintf(L"--- %s (%s) ---\n",
             mon.friendlyName.empty() ? L"(unknown)" : mon.friendlyName.c_str(),
@@ -1209,13 +1220,22 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
 
         if (anyRestored)
         {
-            BOOL prevState = FALSE;
-            if (WcsGetCalibrationManagementState(&prevState))
+            // The calibration-management OFF/ON toggle disables colour management for
+            // ALL displays during the window — when only one monitor is targeted, skip
+            // it and rely on the in-process refresh so the others are left untouched.
+            if (!singleMonitor)
             {
-                WcsSetCalibrationManagementState(FALSE);
-                Sleep(100);
-                WcsSetCalibrationManagementState(TRUE);
+                BOOL prevState = FALSE;
+                if (WcsGetCalibrationManagementState(&prevState))
+                {
+                    WcsSetCalibrationManagementState(FALSE);
+                    Sleep(100);
+                    WcsSetCalibrationManagementState(TRUE);
+                }
             }
+            else if (verbose)
+                wprintf(L"  (single-monitor: skipping global calibration toggle)\n");
+
             if (gpuApi.RefreshCalibration)
                 gpuApi.RefreshCalibration();
         }
@@ -1365,13 +1385,22 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
         {
             wprintf(L"  Activating calibration pipeline (please wait)...\n");
 
-            // A) Toggle calibration management OFF/ON to force re-evaluation
-            WcsSetCalibrationManagementState(FALSE);
-            Sleep(100);
-            BOOL setOk = WcsSetCalibrationManagementState(TRUE);
-            if (verbose)
-                wprintf(L"  Calibration management toggle: %s\n",
-                        setOk ? L"OK" : L"failed");
+            // A) Toggle calibration management OFF/ON to force re-evaluation.
+            //    This disables colour management for EVERY display during the gap, so
+            //    when a single monitor is targeted we skip it to spare the others —
+            //    the in-process refresh (B) and the loader task (E) still activate our
+            //    target. Calibration management was already ensured ON further above.
+            if (!singleMonitor)
+            {
+                WcsSetCalibrationManagementState(FALSE);
+                Sleep(100);
+                BOOL setOk = WcsSetCalibrationManagementState(TRUE);
+                if (verbose)
+                    wprintf(L"  Calibration management toggle: %s\n",
+                            setOk ? L"OK" : L"failed");
+            }
+            else if (verbose)
+                wprintf(L"  (single-monitor: skipping global calibration toggle)\n");
 
             // B) InternalRefreshCalibration (undocumented reload trigger)
             if (gpuApi.RefreshCalibration)
@@ -1391,29 +1420,37 @@ static bool ProcessMonitor(const MonitorInfo& mon, const std::wstring& manualPro
             if (verbose)
                 wprintf(L"  WM_SETTINGCHANGE ImmersiveColorSet broadcast sent.\n");
 
-            // D) Re-apply display config (triggers WM_DISPLAYCHANGE)
-            UINT32 pathCount = 0, modeCount = 0;
-            if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
-                                            &pathCount, &modeCount) == ERROR_SUCCESS)
+            // D) Re-apply display config (triggers WM_DISPLAYCHANGE). This re-applies
+            //    the modes of ALL outputs at once and can reset gamma ramps across the
+            //    whole desktop — the heaviest cross-monitor disruptor here — so skip it
+            //    when a single monitor is targeted.
+            if (!singleMonitor)
             {
-                std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-                std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-                if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
-                                       &pathCount, paths.data(),
-                                       &modeCount, modes.data(),
-                                       nullptr) == ERROR_SUCCESS)
+                UINT32 pathCount = 0, modeCount = 0;
+                if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+                                                &pathCount, &modeCount) == ERROR_SUCCESS)
                 {
-                    paths.resize(pathCount);
-                    modes.resize(modeCount);
-                    LONG dcErr = SetDisplayConfig(
-                        (UINT32)paths.size(), paths.data(),
-                        (UINT32)modes.size(), modes.data(),
-                        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
-                    if (verbose)
-                        wprintf(L"  SetDisplayConfig refresh: %s (err=%ld)\n",
-                                dcErr == ERROR_SUCCESS ? L"OK" : L"failed", dcErr);
+                    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+                    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+                    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                           &pathCount, paths.data(),
+                                           &modeCount, modes.data(),
+                                           nullptr) == ERROR_SUCCESS)
+                    {
+                        paths.resize(pathCount);
+                        modes.resize(modeCount);
+                        LONG dcErr = SetDisplayConfig(
+                            (UINT32)paths.size(), paths.data(),
+                            (UINT32)modes.size(), modes.data(),
+                            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES);
+                        if (verbose)
+                            wprintf(L"  SetDisplayConfig refresh: %s (err=%ld)\n",
+                                    dcErr == ERROR_SUCCESS ? L"OK" : L"failed", dcErr);
+                    }
                 }
             }
+            else if (verbose)
+                wprintf(L"  (single-monitor: skipping full display-config re-apply)\n");
 
             // E) Run the Windows Calibration Loader scheduled task directly.
             //    This is the official Windows mechanism for loading calibrations.
@@ -2779,6 +2816,8 @@ typedef NvAPI_Status (*NvAPI_GPU_SetDitherControl_t)(NvPhysicalGpuHandle gpu, Nv
 typedef NvAPI_Status (*NvAPI_GPU_GetDitherControl_t)(NvU32 displayId, NV_GPU_DITHER_CONTROL_V1* pControl);
 // Convert gpu handle + outputId → displayId
 typedef NvAPI_Status (*NvAPI_SYS_GetDisplayIdFromGpuAndOutputId_t)(NvPhysicalGpuHandle gpu, NvU32 outputId, NvU32* displayId);
+// Resolve the GDI device name (e.g. "\\.\DISPLAY1") associated with a display handle.
+typedef NvAPI_Status (*NvAPI_GetAssociatedNvidiaDisplayName_t)(NvDisplayHandle display, char szName[64]);
 typedef NvAPI_Status (*NvAPI_GetErrorMessage_t)(NvAPI_Status nr, char szDesc[64]);
 
 // NvAPI function IDs (resolved via nvapi_QueryInterface)
@@ -2791,6 +2830,7 @@ static constexpr NvU32 NVFUNC_GET_ASSOC_DISPLAY_OUTPUT_ID = 0xD995937E;
 static constexpr NvU32 NVFUNC_SET_DITHER_CONTROL          = 0xDF0DFCDD;
 static constexpr NvU32 NVFUNC_GET_DITHER_CONTROL          = 0x932AC8FB;
 static constexpr NvU32 NVFUNC_DISPLAYID_FROM_GPU_OUTPUT   = 0x08F2BAB4;
+static constexpr NvU32 NVFUNC_GET_ASSOC_DISPLAY_NAME      = 0x22A78B05;
 static constexpr NvU32 NVFUNC_GET_ERROR_MESSAGE           = 0x6C2D048C;
 
 struct NvApiContext {
@@ -2804,6 +2844,7 @@ struct NvApiContext {
     NvAPI_GPU_SetDitherControl_t SetDitherControl;
     NvAPI_GPU_GetDitherControl_t GetDitherControl;
     NvAPI_SYS_GetDisplayIdFromGpuAndOutputId_t GetDisplayIdFromGpuAndOutputId;
+    NvAPI_GetAssociatedNvidiaDisplayName_t GetAssocDisplayName;
     NvAPI_GetErrorMessage_t GetErrorMessage;
 };
 
@@ -2836,6 +2877,7 @@ static bool LoadNvApi(NvApiContext& ctx, bool verbose)
     ctx.SetDitherControl  = (NvAPI_GPU_SetDitherControl_t)qi(NVFUNC_SET_DITHER_CONTROL);
     ctx.GetDitherControl  = (NvAPI_GPU_GetDitherControl_t)qi(NVFUNC_GET_DITHER_CONTROL);
     ctx.GetDisplayIdFromGpuAndOutputId = (NvAPI_SYS_GetDisplayIdFromGpuAndOutputId_t)qi(NVFUNC_DISPLAYID_FROM_GPU_OUTPUT);
+    ctx.GetAssocDisplayName = (NvAPI_GetAssociatedNvidiaDisplayName_t)qi(NVFUNC_GET_ASSOC_DISPLAY_NAME);
     ctx.GetErrorMessage   = (NvAPI_GetErrorMessage_t)qi(NVFUNC_GET_ERROR_MESSAGE);
 
     if (!ctx.Initialize || !ctx.EnumDisplayHandle || !ctx.GetGPUsFromDisplay ||
@@ -2869,6 +2911,23 @@ static const char* NvApiErrorStr(NvApiContext& ctx, NvAPI_Status st)
     }
     wsprintfA(buf, "status %d", st);
     return buf;
+}
+
+// Resolve the GDI device name (e.g. "\\.\DISPLAY1") bound to an NvAPI display
+// handle, so a -m selection made against the DisplayConfig enumeration can be
+// matched to the correct panel in NvAPI's independent enumeration order.
+// Returns empty if the resolver isn't present on this driver or the call fails.
+static std::wstring NvDisplayGdiName(const NvApiContext& nv, NvDisplayHandle display)
+{
+    if (!nv.GetAssocDisplayName) return L"";
+
+    char name[64] = {};
+    if (nv.GetAssocDisplayName(display, name) != NVAPI_OK || name[0] == '\0')
+        return L"";
+
+    wchar_t wname[64] = {};
+    MultiByteToWideChar(CP_ACP, 0, name, -1, wname, 64);
+    return wname;
 }
 
 // SEH-isolated helpers: NvAPI function pointers resolved via QueryInterface may be
@@ -2907,8 +2966,13 @@ static bool SafeSetDitherControl(NvAPI_GPU_SetDitherControl_t fn,
 }
 
 // ditherMode: 0=SpatialDynamic, 1=SpatialStatic, 2=SpatialDynamic2x2, 3=SpatialStatic2x2, 4=Temporal
-// targetDisplay: 0 = all displays, 1-based = specific display index
-static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose, int targetDisplay = 0)
+// Per-display targeting: when targetGdiName is set (e.g. "\\.\DISPLAY1"), only the
+// panel with that GDI name is touched — matched against NvAPI's own enumeration so
+// it lands on the SAME display that -m selects in the DisplayConfig order. targetIndex
+// (1-based, 0 = all) is the positional fallback used only when the driver cannot
+// resolve a handle's name. Pass both empty/0 to apply to every display.
+static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose,
+                                 const std::wstring& targetGdiName = L"", int targetIndex = 0)
 {
     NvApiContext nv;
     if (!LoadNvApi(nv, verbose))
@@ -2947,8 +3011,15 @@ static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose, i
 
         displayCount++;
 
-        if (targetDisplay > 0 && static_cast<int>(i + 1) != targetDisplay)
-            continue;
+        if (!targetGdiName.empty() || targetIndex > 0)
+        {
+            std::wstring thisName = NvDisplayGdiName(nv, display);
+            bool match = (!thisName.empty() && !targetGdiName.empty())
+                       ? (_wcsicmp(thisName.c_str(), targetGdiName.c_str()) == 0)
+                       : (static_cast<int>(i + 1) == targetIndex);
+            if (!match)
+                continue;
+        }
 
         // Get GPU handle for this display
         NvPhysicalGpuHandle gpus[NVAPI_MAX_PHYSICAL_GPUS] = {};
@@ -3047,7 +3118,8 @@ static bool EnableNvApiDithering(int ditherBits, int ditherMode, bool verbose, i
     return successCount > 0;
 }
 
-static bool DisableNvApiDithering(bool verbose, int targetDisplay = 0)
+static bool DisableNvApiDithering(bool verbose, const std::wstring& targetGdiName = L"",
+                                  int targetIndex = 0)
 {
     NvApiContext nv;
     if (!LoadNvApi(nv, verbose))
@@ -3067,8 +3139,15 @@ static bool DisableNvApiDithering(bool verbose, int targetDisplay = 0)
 
         displayCount++;
 
-        if (targetDisplay > 0 && static_cast<int>(i + 1) != targetDisplay)
-            continue;
+        if (!targetGdiName.empty() || targetIndex > 0)
+        {
+            std::wstring thisName = NvDisplayGdiName(nv, display);
+            bool match = (!thisName.empty() && !targetGdiName.empty())
+                       ? (_wcsicmp(thisName.c_str(), targetGdiName.c_str()) == 0)
+                       : (static_cast<int>(i + 1) == targetIndex);
+            if (!match)
+                continue;
+        }
 
         NvPhysicalGpuHandle gpus[NVAPI_MAX_PHYSICAL_GPUS] = {};
         NvU32 gpuCount = 0;
@@ -3511,7 +3590,9 @@ int wmain(int argc, wchar_t* argv[])
         freopen_s(&dummy, "CONOUT$", "w", stderr);
     }
 
-    wprintf(L"ApplyIccLut - ICC/Cube LUT Loader for Windows 11\n");
+    // Lead with a blank line: as a /SUBSYSTEM:WINDOWS app attaching to the parent
+    // console, our first output otherwise lands on the same row as the shell prompt.
+    wprintf(L"\nApplyIccLut - ICC/Cube LUT Loader for Windows 11\n");
     wprintf(L"=================================================\n\n");
 
     // Parse arguments
@@ -3726,12 +3807,18 @@ int wmain(int argc, wchar_t* argv[])
         return 0;
     }
 
+    // Enumerate displays up front. The dithering paths need this to resolve a -m
+    // selection to a stable per-display GDI name (NvAPI enumerates in its own order),
+    // and the colour-pipeline work below reuses the same list.
+    auto monitors = EnumerateMonitors();
+
     // Handle dithering modes (these are independent of the LUT pipeline)
     if (ditherMode)
     {
         // Try NvAPI hardware dithering first (NVIDIA GPUs)
         wprintf(L"Dithering: attempting NvAPI hardware dithering...\n");
-        if (EnableNvApiDithering(ditherBits, ditherModeVal, verbose, targetMonitor))
+        if (EnableNvApiDithering(ditherBits, ditherModeVal, verbose,
+                                 GdiNameForTarget(monitors, targetMonitor), targetMonitor))
         {
             // Write flag file for boot persistence with "nvapi:" prefix
             // Format: "nvapi:<bits>,<mode>,<monitor>"
@@ -3761,7 +3848,7 @@ int wmain(int argc, wchar_t* argv[])
     {
         // Disable NvAPI hardware dithering (safe even if not NVIDIA)
         wprintf(L"Dithering: disabling...\n");
-        DisableNvApiDithering(verbose, targetMonitor);
+        DisableNvApiDithering(verbose, GdiNameForTarget(monitors, targetMonitor), targetMonitor);
 
         // Also remove DWM-injected dithering and flag files
         UninjectAndRemoveDither(verbose);
@@ -3855,7 +3942,8 @@ int wmain(int argc, wchar_t* argv[])
             if (storedNvApi)
             {
                 wprintf(L"Dithering: re-enabling NvAPI hardware dithering (flag file present)...\n");
-                EnableNvApiDithering(storedBits, storedMode, verbose, storedMonitor);
+                EnableNvApiDithering(storedBits, storedMode, verbose,
+                                     GdiNameForTarget(monitors, storedMonitor), storedMonitor);
                 wprintf(L"\n");
             }
             else if (!IsDitherAlreadyInjected())
@@ -3879,8 +3967,7 @@ int wmain(int argc, wchar_t* argv[])
     if (targetSdr) hdrModes.push_back(false); // SDR first
     if (targetHdr) hdrModes.push_back(true);  // then HDR
 
-    // Enumerate displays
-    auto monitors = EnumerateMonitors();
+    // Displays were enumerated up front (above the dithering paths).
     if (monitors.empty())
     {
         wprintf(L"ERROR: No active displays found.\n");
@@ -3931,7 +4018,7 @@ int wmain(int argc, wchar_t* argv[])
 
             if (ProcessMonitor(monitors[i], manualProfile, resetMode, restoreMode,
                                setGpuMode, setGpuProfile, hdrModes,
-                               forceApply, verbose, gpuApi))
+                               forceApply, targetMonitor > 0, verbose, gpuApi))
                 okCount++;
             else
                 failCount++;
